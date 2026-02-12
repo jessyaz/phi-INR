@@ -1,5 +1,5 @@
 
 
 class CHypNetINR():
-    print("test")
+    print("test2")
     pass

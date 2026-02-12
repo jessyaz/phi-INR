@@ -9,6 +9,9 @@ nz/data/
 nz/logs/
 nz/tmp/
 
+nz/envs/mnt
+
+
 # Query files
 queries/
 
