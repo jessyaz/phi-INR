@@ -4,8 +4,11 @@
 # ./create_env.sh cpu
 # ./create_env.sh gpu
 
-ENV_PATH="./mnt/nz-env"
 ENV_FILE="environment.yml"
+
+ENV_NAME=$(grep '^name:' "$ENV_FILE" | awk '{print $2}')
+
+ENV_PATH="./mnt/$ENV_NAME"
 
 if [ -z "$1" ]; then
     echo "Usage: ./create_env.sh [cpu|gpu]"
@@ -14,9 +17,8 @@ fi
 
 MODE=$1
 
-echo "Création de l'environnement dans $ENV_PATH"
+echo "Création de l'environnement '$ENV_NAME' dans $ENV_PATH"
 
-# Vérifie si l'environnement existe déjà
 if [ -d "$ENV_PATH" ]; then
     echo "L'environnement existe déjà, mise à jour..."
     conda env update --prefix $ENV_PATH -f $ENV_FILE --prune

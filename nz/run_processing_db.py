@@ -5,9 +5,11 @@ from typing import List, Tuple, Callable
 import nz.src.data_processors.test_db_struct as db_struct
 from pathlib import Path
 
+from nz.src.data_processors.utils_pipeline import mount_worker, mount_consumer, progress_monitor
 
 
-from nz.tasks import mount_worker, mount_consumer, progress_monitor
+import os
+
 
 def parallel_orchestrator(db_path: str, tasks: List[Tuple], chunksize: int, n_producers: int, n_consumers: int, process_func: Callable, queue_maxsize: int, total_tasks : int):
 
@@ -68,6 +70,8 @@ def parallel_orchestrator(db_path: str, tasks: List[Tuple], chunksize: int, n_pr
 
 def run(base_path='./nz/data/raw/'):
     print("Initialisation...")
+
+    print(os.listdir())
 
     path_obj = Path(base_path)
     db_file = path_obj / 'NZDB.db'
