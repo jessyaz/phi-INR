@@ -6,25 +6,30 @@ from tqdm import tqdm
 
 from multiprocessing import Process, Queue, Event, Manager
 
-def mount_worker(worker_id, tasks, db_path, chunksize, output_queue, stop_event, progress_dict):
+def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queue, stop_event, progress_dict):
 
     if isinstance(chunksize, str):
         chunksize = int(chunksize.replace("_", ""))
 
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path) as conn, sqlite3.connect(db_path_era5) as conn_era5:
         try:
             for year, region in tasks:
                 if stop_event.is_set():
                     break
                 try:
 
-                    siteref_list = conn.cursor().execute(
-                        "SELECT DISTINCT SITEREF FROM flow_meta WHERE REGION = ?", (region,)
+                    siteref_card = conn.cursor().execute(
+                        "SELECT DISTINCT SITEREF, LON, LAT FROM flow_meta WHERE REGION = ?", (region,)
                     ).fetchall()
-                    siteref_list = [row[0] for row in siteref_list]
 
-                    if not siteref_list:
+                    if not siteref_card:
+                        print(f"No siteref to follow... ({region} , {year})")
                         continue
+
+                    siteref_card_df = pd.DataFrame(siteref_card, columns=['SITEREF', 'LON', 'LAT'])
+                    #siteref_card = [row[0] for row in siteref_card]
+
+                    siteref_list = siteref_card_df['SITEREF'].tolist()
 
                     placeholders = ','.join(['?'] * len(siteref_list))
                     query = f"SELECT * FROM flow WHERE SITEREF IN ({placeholders}) AND strftime('%Y', DATETIME) = ?"
@@ -33,6 +38,23 @@ def mount_worker(worker_id, tasks, db_path, chunksize, output_queue, stop_event,
                     chunk_idx = 0
                     for chunk in pd.read_sql(query, conn, params=params, chunksize=chunksize):
                         if stop_event.is_set(): break
+
+                        chunk = chunk.merge(siteref_card_df, on='SITEREF', how='left')
+
+                        #((df['lon'] % 360) * 4).round() / 4
+                        #(df['lat'] * 4).round() / 4
+                        lon, lat = ((chunk['LON']% 360) * 4).round() / 4, (chunk['LAT'] * 4).round() / 4
+
+                        # Approcher chun long lat a la grille météo
+                        # Pb boucle
+
+                        weather = conn_era5.cursor().execute(
+                            f"SELECT * FROM weather_data WHERE longitude = ({lon}) AND latitude = ({lat}) ;",
+                            (lon,lat)
+                        )
+
+                        print(weather, chunk)
+
 
                         output_queue.put({
                             'worker_id': worker_id,

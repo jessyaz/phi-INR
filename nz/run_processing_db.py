@@ -11,7 +11,7 @@ from nz.src.data_processors.utils_pipeline import mount_worker, mount_consumer, 
 import os
 
 
-def parallel_orchestrator(db_path: str, tasks: List[Tuple], chunksize: int, n_producers: int, n_consumers: int, process_func: Callable, queue_maxsize: int, total_tasks : int):
+def parallel_orchestrator(db_path: str, db_path_era5: str, tasks: List[Tuple], chunksize: int, n_producers: int, n_consumers: int, process_func: Callable, queue_maxsize: int, total_tasks : int):
 
     ctx = multiprocessing.get_context('spawn')
     manager = ctx.Manager()
@@ -35,7 +35,7 @@ def parallel_orchestrator(db_path: str, tasks: List[Tuple], chunksize: int, n_pr
 
     producers = []
     for i in range(n_producers):
-        p = ctx.Process(target=mount_worker, args=(i, producer_tasks[i], str(db_path), chunksize, data_queue, stop_event, progress_dict))
+        p = ctx.Process(target=mount_worker, args=(i, producer_tasks[i], db_path, db_path_era5,chunksize, data_queue, stop_event, progress_dict))
         p.start()
         producers.append(p)
 
@@ -75,6 +75,7 @@ def run(base_path='./nz/data/raw/'):
 
     path_obj = Path(base_path)
     db_file = path_obj / 'NZDB.db'
+    db_era5_file = path_obj / 'era5/era5_data.db'
 
     test_result = db_struct.test()
 
@@ -94,6 +95,7 @@ def run(base_path='./nz/data/raw/'):
 
     parallel_orchestrator(
         db_path=str(db_file),
+        db_path_era5=str(db_era5_file),
         tasks=tasks,
         chunksize="100_000",
         n_producers=8,
