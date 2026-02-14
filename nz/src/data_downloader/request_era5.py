@@ -43,7 +43,7 @@ for year in range(2013, 2023):
 
         # Reprise sur erreur : si le fichier existe, on passe au suivant
         if os.path.exists(filepath):
-            print(f"✅ {filename} existe déjà. Ignoré.")
+            print(f"{filename} existe déjà. Ignoré.")
             continue
 
         print(f"⏳ Téléchargement : {year}-{month:02d} ...")
