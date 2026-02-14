@@ -74,8 +74,8 @@ def run(base_path='./nz/data/raw/'):
     print(os.listdir())
 
     path_obj = Path(base_path)
-    db_file = path_obj / 'NZDB.db'
-    db_era5_file = path_obj / 'era5/era5_data.db'
+    db_file = path_obj / 'nz_downloads/NZDB.db'
+    db_era5_file = path_obj / 'era5_downloads/era5_data.db'
 
     test_result = db_struct.test()
 

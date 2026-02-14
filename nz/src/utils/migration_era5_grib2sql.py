@@ -18,18 +18,18 @@ total_lines = 0
 
 for filename in tqdm(files):
     try:
+
         parts = filename.split("_")
         y = int(parts[-2])
         m = int(parts[-1].split('.')[0])
 
-        datasects = cfgrib.open_datasets(
+        datasets = cfgrib.open_datasets(
             os.path.join(path_era5, filename),
             backend_kwargs={"indexpath": ""}
         )
 
         df_inst = datasets[1].to_dataframe().reset_index()[['time', 'latitude', 'longitude', 'msl', 'tcc', 'u10', 'v10', 't2m', 'd2m']]
         df_accum = datasets[0].to_dataframe().reset_index()[['time', 'latitude', 'longitude', 'tp', 'cp', 'ssrd']]
-
         df_final = pd.merge(
             df_inst,
             df_accum,
