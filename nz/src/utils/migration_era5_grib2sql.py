@@ -27,11 +27,6 @@ for filename in tqdm(files):
 
         df_inst = datasets[1].to_dataframe().reset_index()#[['time', 'latitude', 'longitude', 'msl', 'tcc', 'u10', 'v10', 't2m', 'd2m']]
         df_accum = datasets[0].to_dataframe().reset_index()#[['time', 'latitude', 'longitude', 'tp', 'cp', 'ssrd']]
-        cols_i = ['time', 'latitude', 'longitude', 'msl', 'tcc', 'u10', 'v10', 't2m', 'd2m']
-        cols_a = ['time', 'latitude', 'longitude', 'tp', 'cp', 'ssrd']
-
-        df_inst = df_inst[[c for c in cols_i if c in df_inst.columns]]
-        df_accum = df_accum[[c for c in cols_a if c in df_accum.columns]]
 
         df_final = pd.merge(
             df_inst,
