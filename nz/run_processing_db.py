@@ -98,10 +98,10 @@ def run(base_path='./nz/data/raw/'):
         db_path_era5=str(db_era5_file),
         tasks=tasks,
         chunksize="100_000",
-        n_producers=8,
-        n_consumers=8,
+        n_producers=1,
+        n_consumers=1,
         process_func=None,
-        queue_maxsize=10,
+        queue_maxsize=20,
         total_tasks=len(tasks)
     )
 

@@ -23,7 +23,7 @@ class NzStruct():
 
     def __init__(self, path: str = '../data/raw') -> None:
         self.path = Path(path)
-        json_file = self.path / 'metadata.json'
+        json_file = self.path / 'nz_downloads/metadata.json'
 
         if os.path.exists(json_file):
             print("Lecture du cache..")
@@ -48,7 +48,7 @@ class NzStruct():
     def __fetchDataBase(self) -> Tuple[list, list]:
         print("Fetching metadata in database ...")
 
-        db_path = self.path / 'NZDB.db'
+        db_path = self.path / 'nz_downloads/NZDB.db'
         self.conn = sqlite3.connect(str(db_path))
 
         try:

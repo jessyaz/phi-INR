@@ -6,14 +6,27 @@ from tqdm import tqdm
 
 from multiprocessing import Process, Queue, Event, Manager
 
+
+def chk_conn(conn):
+    try:
+        conn.cursor()
+        return True
+    except Exception as ex:
+        return False
+
 def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queue, stop_event, progress_dict):
 
     if isinstance(chunksize, str):
         chunksize = int(chunksize.replace("_", ""))
 
     with sqlite3.connect(db_path) as conn, sqlite3.connect(db_path_era5) as conn_era5:
+
+        print('connexion bdd set : traffic, era5 :', chk_conn(conn), chk_conn(conn_era5))
+
         try:
+
             for year, region in tasks:
+
                 if stop_event.is_set():
                     break
                 try:
@@ -32,8 +45,20 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
                     siteref_list = siteref_card_df['SITEREF'].tolist()
 
                     placeholders = ','.join(['?'] * len(siteref_list))
-                    query = f"SELECT * FROM flow WHERE SITEREF IN ({placeholders}) AND strftime('%Y', DATETIME) = ?"
+                    query = f"SELECT * FROM flow WHERE SITEREF IN ({placeholders}) AND strftime('%M', DATETIME) = ?"
                     params = siteref_list + [str(year)]
+
+            #        # Get another data in nz traffic - DO this in preprocessing to get scheme .
+            #        df_holiday = pd.read_sql(
+            #            "SELECT * FROM extreme_weather WHERE REGION = ? AND strftime('%M', DATETIME) = ?",
+            #            conn,
+            #            params=params
+            #        )
+            #        df_extreme_weather = pd.read_sql(
+            #            "SELECT * FROM holiday WHERE REGION = ? AND strftime('%Y', DATETIME) = ?",
+            #            conn,
+            #            params=params
+            #        )
 
                     chunk_idx = 0
                     for chunk in pd.read_sql(query, conn, params=params, chunksize=chunksize):
@@ -43,18 +68,37 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
 
                         #((df['lon'] % 360) * 4).round() / 4
                         #(df['lat'] * 4).round() / 4
-                        lon, lat = ((chunk['LON']% 360) * 4).round() / 4, (chunk['LAT'] * 4).round() / 4
+                   #    lon, lat = ((chunk['LON']% 360) * 4).round() / 4, (chunk['LAT'] * 4).round() / 4
+                   #     weather = conn_era5.cursor().execute(
+                   #         f"SELECT * FROM weather_data WHERE longitude = ({lon}) AND latitude = ({lat}) ;",
+                   #         (lon,lat)
+                   #     )
 
-                        # Approcher chun long lat a la grille météo
-                        # Pb boucle
+                        chunk['grid_lon'] = ((chunk['LON'] % 360) * 4).round() / 4
+                        chunk['grid_lat'] = (chunk['LAT'] * 4).round() / 4
 
-                        weather = conn_era5.cursor().execute(
-                            f"SELECT * FROM weather_data WHERE longitude = ({lon}) AND latitude = ({lat}) ;",
-                            (lon,lat)
-                        )
+                        unique_long_lat = chunk[['grid_lon', 'grid_lat']].drop_duplicates()
+                        weather_chunks = []
+                        for _, row in unique_long_lat.iterrows():
+                            weather_data = pd.read_sql(
+                                "SELECT * FROM weather_data WHERE longitude = ? AND latitude = ?",
+                                conn_era5,
+                                params=(row['grid_lon'], row['grid_lat'])
+                            )
+                            weather_chunks.append(weather_data)
 
-                        print(weather, chunk)
+                        if weather_chunks: # Pour le test local -- suppr
+                            weather_df = pd.concat(weather_chunks).drop_duplicates()
+                            chunk = chunk.merge(weather_df,
+                                left_on=['grid_lon', 'grid_lat'],
+                                right_on=['longitude', 'latitude'],
+                                how='left'
+                            )
+                        else:
+                            print(f"No weather data... ({region} , {year})")
 
+                        print(chunk.columns)
+                        print(chunk.head())
 
                         output_queue.put({
                             'worker_id': worker_id,
