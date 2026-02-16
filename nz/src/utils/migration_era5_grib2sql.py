@@ -14,37 +14,38 @@ conn.commit()
 print("Processing era5...")
 
 files = [f for f in os.listdir(path_era5) if f.endswith('.grib')]
+files.sort()
 total_lines = 0
 
 for filename in tqdm(files):
     try:
-
-        parts = filename.split("_")
-        y = int(parts[-2])
-        m = int(parts[-1].split('.')[0])
 
         datasets = cfgrib.open_datasets(
             os.path.join(path_era5, filename),
             backend_kwargs={"indexpath": ""}
         )
 
-        df_inst = datasets[1].to_dataframe().reset_index()[['time', 'latitude', 'longitude', 'msl', 'tcc', 'u10', 'v10', 't2m', 'd2m']]
-        df_accum = datasets[0].to_dataframe().reset_index()[['time', 'latitude', 'longitude', 'tp', 'cp', 'ssrd']]
+        df_inst = datasets[1].to_dataframe().reset_index()#[['time', 'latitude', 'longitude', 'msl', 'tcc', 'u10', 'v10', 't2m', 'd2m']]
+        df_accum = datasets[0].to_dataframe().reset_index()#[['time', 'latitude', 'longitude', 'tp', 'cp', 'ssrd']]
+        cols_i = ['time', 'latitude', 'longitude', 'msl', 'tcc', 'u10', 'v10', 't2m', 'd2m']
+        cols_a = ['time', 'latitude', 'longitude', 'tp', 'cp', 'ssrd']
+
+        df_inst = df_inst[[c for c in cols_i if c in df_inst.columns]]
+        df_accum = df_accum[[c for c in cols_a if c in df_accum.columns]]
+
         df_final = pd.merge(
             df_inst,
             df_accum,
             on=['time', 'latitude', 'longitude'],
-            how='inner'
+            how='outer'
         )
 
         df_final['time'] = pd.to_datetime(df_final['time'])
-
-        df_final = df_final[
-            (df_final['time'].dt.year == y) &
-            (df_final['time'].dt.month == m)
-            ]
-
         df_final['time'] = df_final['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        df_final['latitude'] = df_final['latitude'].round(2)
+        df_final['longitude'] = df_final['longitude'].round(2)
+
+        df_final = df_final.drop_duplicates(subset=['time', 'latitude', 'longitude'])
 
         df_final.to_sql('weather_data', conn, if_exists='append', index=False)
 
