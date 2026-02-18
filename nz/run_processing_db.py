@@ -75,12 +75,15 @@ def run(base_path='./nz/data/raw/'):
 
     path_obj = Path(base_path)
     db_file = path_obj / 'nz_downloads/NZDB.db'
-    db_era5_file = path_obj / 'era5_downloads/era5_data.db'
+    db_era5_folder = path_obj / 'era5_downloads/'
+    db_era5_db = db_era5_folder / 'era5_data.db'
 
     test_result = db_struct.test()
 
     db_instance = db_struct.NzStruct(str(path_obj))
     metadata = db_instance.getMetadata()
+
+    db_era5_instance = db_struct.ERA5Struct(db_era5_folder)
 
     flow_datetime = pd.to_datetime(metadata['flow_datetime']['datetime'])
     flow_region = metadata['flow_region']['region']
@@ -94,8 +97,8 @@ def run(base_path='./nz/data/raw/'):
     print(f"Total Tâches: {len(tasks)}")
 
     parallel_orchestrator(
-        db_path=str(db_file),
-        db_path_era5=str(db_era5_file),
+        db_path=db_file,
+        db_path_era5=db_era5_db,
         tasks=tasks,
         chunksize="100_000",
         n_producers=1,

@@ -7,3 +7,6 @@ dependencies:
   - geopandas
   - tqdm
   - openpyxl
+
+
+#conda update -c conda-forge cfgrib eccodes
