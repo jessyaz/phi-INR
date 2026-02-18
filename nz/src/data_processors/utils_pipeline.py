@@ -65,13 +65,21 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
 
                         chunk = chunk.merge(siteref_card_df, on='SITEREF', how='left')
 
-                        # Align UTC-NZ-FLOW WITH ERA5-UTC
-                        chunk['time_utc'] = (
+                        # Align UTC-NZ-FLOW WITH ERA5-UTC -> UTC EN RECULE ?? SENS ??
+                        chunk['DATETIME'] = (
                             pd.to_datetime(chunk['DATETIME'])
-                            .dt.tz_localize('Pacific/Auckland', ambiguous=True, nonexistent='shift_forward')
-                            .dt.tz_convert('UTC')
-                            .dt.tz_localize(None)
+                            .dt.tz_localize('Pacific/Auckland') #, ambiguous=True, nonexistent='shift_forward')
+                            #.dt.tz_convert('UTC')
+                            #.dt.tz_localize(None)
                             .dt.floor('h')
+                        )
+
+                        chunk['time_utc'] = (
+                            pd.to_datetime(chunk['time_utc'])
+                            .dt.tz_localize('UTC')
+                            .dt.tz_convert('UTC')
+                            #.dt.tz_localize(None)
+                           # .dt.floor('h')
                         )
 
                         points_trafic = chunk[['LON', 'LAT']].values
