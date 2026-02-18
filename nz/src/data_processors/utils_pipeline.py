@@ -65,22 +65,15 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
 
                         chunk = chunk.merge(siteref_card_df, on='SITEREF', how='left')
 
-                        # Align UTC-NZ-FLOW WITH ERA5-UTC -> UTC EN RECULE ?? SENS ??
-                        chunk['DATETIME'] = (
-                            pd.to_datetime(chunk['DATETIME'])
-                            .dt.tz_localize('Pacific/Auckland') #, ambiguous=True, nonexistent='shift_forward')
-                            #.dt.tz_convert('UTC')
-                            #.dt.tz_localize(None)
+                        chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME'])
+                        dt_nz = (
+                            chunk['DATETIME']
+                            .dt.tz_localize('Pacific/Auckland', ambiguous='NaT', nonexistent='shift_forward')
                             .dt.floor('h')
                         )
+                        chunk['DATETIME_NZ'] = dt_nz
+                        chunk['time_in_utc'] = dt_nz.dt.tz_convert('UTC').dt.tz_localize(None)
 
-                        chunk['time_utc'] = (
-                            pd.to_datetime(chunk['time_utc'])
-                            .dt.tz_localize('UTC')
-                            .dt.tz_convert('UTC')
-                            #.dt.tz_localize(None)
-                           # .dt.floor('h')
-                        )
 
                         points_trafic = chunk[['LON', 'LAT']].values
                         _, indices = tree.query(points_trafic)
@@ -89,12 +82,12 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
                         chunk['era5_lat'] = grid_coords[indices, 1].round(2)
 
 
-
                         u_lons = chunk['era5_lon'].unique().tolist()
                         u_lats = chunk['era5_lat'].unique().tolist()
-                        u_times = chunk['time_utc'].dt.strftime('%Y-%m-%d %H:%M:%S').unique().tolist()
+                        #u_times = chunk['time_in_utc'].dt.strftime('%Y-%m-%d %H:%M:%S').unique().tolist()
 
-                        print(chunk[['LON','era5_lon','LAT','era5_lat','DATETIME','time_utc']])
+                        valid_times = chunk['time_in_utc'].dropna()
+                        u_times = valid_times.dt.strftime('%Y-%m-%d %H:%M:%S').unique().tolist()
 
                         ### Get Weather Context
 
@@ -113,27 +106,25 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
 
                         if not weather_df.empty:
 
-                            weather_df['time'] = pd.to_datetime(weather_df['time']).dt.tz_localize(None)
+                            weather_df['time'] = pd.to_datetime(weather_df['time'])
                             weather_df['longitude'] = weather_df['longitude'].astype(float).round(2)
                             weather_df['latitude'] = weather_df['latitude'].astype(float).round(2)
 
                             chunk = chunk.merge(
                                 weather_df,
-                                left_on=['era5_lon', 'era5_lat', 'time_utc'],
+                                left_on=['era5_lon', 'era5_lat', 'time_in_utc'],
                                 right_on=['longitude', 'latitude', 'time'],
                                 how='left'
                             )
 
-
-                            print("Nombre de NaNs par colonne :")
-                            print(chunk.isna().sum())
                             if chunk.isna().sum().sum() > 1000:
                                 print("AAAAAAAAAAAA")
-                                weather_df.to_csv("./weather.csv")
 
 
                             chunk = chunk.drop(columns=[c for c in ['longitude', 'latitude', 'time', 'time_nz_flow'] if c in chunk.columns])
 
+
+                           # print(chunk.columns)
                         else:
                             print(f"No weather data... ({region} , {year})")
 
@@ -158,27 +149,48 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
             print(f"[Producer {worker_id}] Critical Error: {e}")
 
 def mount_consumer(consumer_id, input_queue, stop_event, process_func, progress_dict):
+
+    cols_to_keep = [
+        'SITEREF', 'DATETIME', 'FLOW', 'WEIGHT', 'DIRECTION',
+        'LON', 'LAT', 'DATETIME_NZ',
+        'era5_lon', 'era5_lat',
+        'msl', 'tcc', 'u10', 'v10', 't2m', 'd2m', 'tp', 'cp', 'ssrd'
+    ]
+
     processed_count = 0
-    while not stop_event.is_set():
-        try:
-            item = input_queue.get(timeout=1)
 
-            if item is None:
-                break
+    with sqlite3.connect("./nz/data/processed/db.db") as conn:
+        while not stop_event.is_set():
+            try:
+                item = input_queue.get(timeout=1)
 
-            chunk = item['data']
+                if item is None:
+                    break
 
-            if process_func:
-                process_func(chunk)
+                chunk = item['data']
 
-            processed_count += 1
-            progress_dict['total_chunks_processed'] += 1
-            progress_dict[f'consumer_{consumer_id}_chunks'] = processed_count
+                chunk = chunk[chunk.columns.intersection(cols_to_keep)]
 
-        except Empty:
-            continue
-        except Exception as e:
-            print(f"[Consumer {consumer_id}] Error: {e}")
+               # if process_func:
+                #    process_func(chunk)
+
+                chunk.to_sql(
+                    'data',
+                    conn,
+                    if_exists='append',
+                    index=False,
+                    method='multi',
+                    chunksize=500
+                )
+
+                processed_count += 1
+                progress_dict['total_chunks_processed'] += 1
+                progress_dict[f'consumer_{consumer_id}_chunks'] = processed_count
+
+            except Empty:
+                continue
+            except Exception as e:
+                print(f"[Consumer {consumer_id}] Error: {e}")
 
 def progress_monitor(progress_dict, stop_event, n_producers, n_consumers, total_tasks):
 
