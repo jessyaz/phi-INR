@@ -3,15 +3,20 @@ import cfgrib
 import sqlite3
 import pandas as pd
 from tqdm import tqdm
-
-path_era5 = "../../data/raw/era5_downloads/"
-path_db_era5 = "../../data/raw/era5_downloads/era5_data.db"
+##
+#import xarray as xr
+#import warnings
+#xr.set_options(use_new_combine_kwarg_defaults=True)
+#warnings.filterwarnings("ignore", category=UserWarning, module='pandas')
+##
+path_era5 = "./nz/data/raw/era5_downloads/"
+path_db_era5 = "./nz/data/raw/era5_downloads/era5_data.db"
 conn = sqlite3.connect(path_db_era5)
 
 conn.execute("DROP TABLE IF EXISTS weather_data")
 conn.commit()
 
-print("Processing era5...")
+print("Processing era5 V2...")
 
 files = [f for f in os.listdir(path_era5) if f.endswith('.grib')]
 files.sort()
@@ -20,25 +25,37 @@ total_lines = 0
 for filename in tqdm(files):
     try:
 
+        target_month = filename.split("_")[-1].split(".")[0]
+
         datasets = cfgrib.open_datasets(
             os.path.join(path_era5, filename),
             backend_kwargs={"indexpath": ""}
         )
 
-        df_inst = datasets[1].to_dataframe().reset_index()#[['time', 'latitude', 'longitude', 'msl', 'tcc', 'u10', 'v10', 't2m', 'd2m']]
-        df_accum = datasets[0].to_dataframe().reset_index()#[['time', 'latitude', 'longitude', 'tp', 'cp', 'ssrd']]
+        df_accum = datasets[0].to_dataframe().reset_index()
+       # print("cola:",df_accum.columns)
+       # print(int(target_month), df_accum['valid_time'].dt.month)
+        df_accum = df_accum[df_accum['valid_time'].dt.month == int(target_month)] # Filtrage supplémentaire
+        df_inst = datasets[1].to_dataframe().reset_index()
+       # print("coli:",df_inst.columns)
 
+        df_accum['time'] = df_accum['valid_time']
+       # df_inst['time'] = df_inst['valid_time']
+
+        # Fusion directe sur les colonnes propres
         df_final = pd.merge(
-            df_inst,
-            df_accum,
+            df_inst[['time', 'latitude', 'longitude', 'msl', 'tcc', 'u10', 'v10', 't2m', 'd2m']],
+            df_accum[['time', 'latitude', 'longitude', 'tp', 'cp', 'ssrd']],
             on=['time', 'latitude', 'longitude'],
             how='outer'
         )
 
-        df_final['time'] = pd.to_datetime(df_final['time'])
-        df_final['time'] = df_final['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        df_final['time'] = pd.to_datetime(df_final['time']).dt.strftime('%Y-%m-%d %H:%M:%S')
         df_final['latitude'] = df_final['latitude'].round(2)
         df_final['longitude'] = df_final['longitude'].round(2)
+
+    #    for col in df_final.select_dtypes(include=['timedelta64']):
+    #        df_final[col] = df_final[col].dt.total_seconds()
 
         df_final = df_final.drop_duplicates(subset=['time', 'latitude', 'longitude'])
 
@@ -46,6 +63,9 @@ for filename in tqdm(files):
 
         print(f"{filename} just been processed : {len(df_final)} total lines !")
         total_lines += len(df_final)
+
+        for ds in datasets:
+            ds.close()
 
     except Exception as e:
         print(f"Skipping {filename}: {e}")
