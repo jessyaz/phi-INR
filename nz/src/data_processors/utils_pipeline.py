@@ -10,6 +10,11 @@ from multiprocessing import Process, Queue, Event, Manager
 
 from scipy.spatial import cKDTree
 
+import numpy as np
+
+
+import pytz
+
 
 
 def chk_conn(conn):
@@ -19,129 +24,141 @@ def chk_conn(conn):
     except Exception as ex:
         return False
 
-def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queue, stop_event, progress_dict):
 
+def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queue, stop_event, progress_dict):
     if isinstance(chunksize, str):
         chunksize = int(chunksize.replace("_", ""))
 
     with sqlite3.connect(db_path) as conn, sqlite3.connect(db_path_era5) as conn_era5:
 
-        print('connexion bdd set : traffic, era5 :', chk_conn(conn), chk_conn(conn_era5))
-
-        with open('./nz/data/raw/era5_downloads/weather_grid.json', "r", encoding="utf-8") as f: # TEMP
-            data = json.load(f)
-            weather_grid = pd.DataFrame(data)
-
+        with open('./nz/data/raw/era5_downloads/weather_grid.json', "r", encoding="utf-8") as f:
+            weather_grid = pd.DataFrame(json.load(f))
             grid_coords = weather_grid[['longitude', 'latitude']].values
             tree = cKDTree(grid_coords)
 
-
         try:
-
-            for year, region in tasks:
-
+            for region, stations_df in tasks:
                 if stop_event.is_set():
                     break
+
                 try:
-
-                    siteref_card = conn.cursor().execute(
-                        "SELECT DISTINCT SITEREF, LON, LAT FROM flow_meta WHERE REGION = ?", (region,)
-                    ).fetchall()
-
-                    if not siteref_card:
-                        print(f"No siteref to follow... ({region} , {year})")
-                        continue
-
-                    siteref_card_df = pd.DataFrame(siteref_card, columns=['SITEREF', 'LON', 'LAT'])
-                    siteref_list = siteref_card_df['SITEREF'].tolist()
-
-                    placeholders = ','.join(['?'] * len(siteref_list))
-                    query = f"SELECT * FROM flow WHERE SITEREF IN ({placeholders}) AND strftime('%Y', DATETIME) = ?"
-                    params = siteref_list + [str(year)]
-
-                    chunk_idx = 0
-                    for chunk in pd.read_sql(query, conn, params=params, chunksize=chunksize):
-                        if stop_event.is_set(): break
-
-                        chunk = chunk.merge(siteref_card_df, on='SITEREF', how='left')
-
-                        chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME'])
-                        dt_nz = (
-                            chunk['DATETIME']
-                            .dt.tz_localize('Pacific/Auckland', ambiguous='NaT', nonexistent='shift_forward')
-                            .dt.floor('h')
-                        )
-                        chunk['DATETIME_NZ'] = dt_nz
-                        chunk['time_in_utc'] = dt_nz.dt.tz_convert('UTC').dt.tz_localize(None)
+                    u_siteref_list = stations_df['SITEREF'].unique().tolist()
 
 
-                        points_trafic = chunk[['LON', 'LAT']].values
-                        _, indices = tree.query(points_trafic)
+                    for siteref in u_siteref_list:
+                        print(siteref)
 
-                        chunk['era5_lon'] = grid_coords[indices, 0].round(2)
-                        chunk['era5_lat'] = grid_coords[indices, 1].round(2)
+                        #placeholders = ','.join(['?'] * len(u_siteref_list))
+                        query = f"SELECT * FROM flow WHERE SITEREF = ? ORDER BY DATETIME"
 
+                        chunk_idx = 0
 
-                        u_lons = chunk['era5_lon'].unique().tolist()
-                        u_lats = chunk['era5_lat'].unique().tolist()
-                        #u_times = chunk['time_in_utc'].dt.strftime('%Y-%m-%d %H:%M:%S').unique().tolist()
+                        #for chunk in pd.read_sql(query, conn, params=[siteref]):
+                        if True:
+                            chunk = pd.read_sql(query, conn, params=[siteref])
 
-                        valid_times = chunk['time_in_utc'].dropna()
-                        u_times = valid_times.dt.strftime('%Y-%m-%d %H:%M:%S').unique().tolist()
-
-                        ### Get Weather Context
-
-                        query_weather = f"""
-                        SELECT * FROM weather_data 
-                        WHERE time IN ({','.join(['?']*len(u_times))})
-                        AND longitude IN ({','.join(['?']*len(u_lons))})
-                        AND latitude IN ({','.join(['?']*len(u_lats))})
-                        """
-
-                       # params = u_times + [lon_min, lon_max, lat_min, lat_max]
-                        params = list(u_times) + list(u_lons) + list(u_lats)#u_lons + u_lats  +u_times
-
-                        weather_df = pd.read_sql(query_weather, conn_era5, params=params)
+                            if stop_event.is_set():
+                                break
 
 
-                        if not weather_df.empty:
+                            chunk = chunk.sort_values('DATETIME')
 
-                            weather_df['time'] = pd.to_datetime(weather_df['time'])
-                            weather_df['longitude'] = weather_df['longitude'].astype(float).round(2)
-                            weather_df['latitude'] = weather_df['latitude'].astype(float).round(2)
-
-                            chunk = chunk.merge(
-                                weather_df,
-                                left_on=['era5_lon', 'era5_lat', 'time_in_utc'],
-                                right_on=['longitude', 'latitude', 'time'],
-                                how='left'
-                            )
-
-                            if chunk.isna().sum().sum() > 1000:
-                                print("AAAAAAAAAAAA")
+                            chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME'])
 
 
-                            chunk = chunk.drop(columns=[c for c in ['longitude', 'latitude', 'time', 'time_nz_flow'] if c in chunk.columns])
+
+                            chunk = chunk[chunk['DATETIME'] >= '2013-01-02']
+                            if chunk.empty:
+                                continue
+
+                            chunk = chunk.merge(stations_df[['SITEREF', 'LON', 'LAT']], on='SITEREF', how='left')
 
 
-                           # print(chunk.columns)
-                        else:
-                            print(f"No weather data... ({region} , {year})")
+                            chunk['DATETIME'] = pd.to_datetime(chunk['DATETIME']).dt.floor('h')
 
-                        output_queue.put({
-                            'worker_id': worker_id,
-                            'year': year,
-                            'region': region,
-                            'chunk_idx': chunk_idx,
-                            'data': chunk,
-                        })
 
-                        progress_dict['total_chunks_produced'] += 1
-                        progress_dict[f'producer_{worker_id}_chunks'] = progress_dict.get(f'producer_{worker_id}_chunks', 0) + 1
-                        chunk_idx += 1
+
+                            try:
+                                chunk['DATETIME_NZ'] = (
+                                    chunk['DATETIME']
+                                    .dt.tz_localize('Pacific/Auckland', ambiguous=False, nonexistent='shift_forward')
+                                )
+                            except Exception as e:
+                                print(e)
+                                print(chunk['DATETIME'])
+
+                           # print(len(chunk['DATETIME_NZ']))
+
+                            #chunk = chunk.sort_values(['WEIGHT', 'DIRECTION', 'DATETIME'])
+
+
+                            #chunk.groupby(['DATETIME','WEIGHT','DIRECTION'])
+                            chunk['time_in_utc'] = chunk['DATETIME_NZ'].dt.tz_convert('UTC').dt.tz_localize(None).values
+
+                            points_trafic = chunk[['LON', 'LAT']].values
+                            _, indices = tree.query(points_trafic)
+
+                            chunk['era5_lon'] = grid_coords[indices, 0].round(2)
+                            chunk['era5_lat'] = grid_coords[indices, 1].round(2)
+
+                            u_lons = chunk['era5_lon'].unique().tolist()
+                            u_lats = chunk['era5_lat'].unique().tolist()
+                            u_times = chunk['time_in_utc'].dt.strftime('%Y-%m-%d %H:%M:%S').unique().tolist()
+
+                            query_weather = f"""
+                                SELECT * FROM weather_data 
+                                WHERE time IN ({','.join(['?']*len(u_times))})
+                                AND longitude IN ({','.join(['?']*len(u_lons))})
+                                AND latitude IN ({','.join(['?']*len(u_lats))})
+                            """
+
+                            weather_params = u_times + u_lons + u_lats
+                            weather_df = pd.read_sql(query_weather, conn_era5, params=weather_params)
+
+
+
+                            if not weather_df.empty:
+                                weather_df['time'] = pd.to_datetime(weather_df['time'])
+                                weather_df['longitude'] = weather_df['longitude'].astype(float).round(2)
+                                weather_df['latitude'] = weather_df['latitude'].astype(float).round(2)
+
+                                chunk = chunk.merge(
+                                    weather_df,
+                                    left_on=['era5_lon', 'era5_lat', 'time_in_utc'],
+                                    right_on=['longitude', 'latitude', 'time'],
+                                    how='left'
+                                )
+
+
+                                nan_report = chunk.isna().sum()
+                                if nan_report.any():
+                                    print(f"\n{'='*80}")
+                                    print(f"NaNs in {region} (Chunk {chunk_idx}): {nan_report[nan_report > 0].to_dict()}")
+                                    with pd.option_context('display.max_columns', None, 'display.width', 1000):
+                                        print("\n[A] Lignes avec NaNs (Trafic) :")
+                                        print(chunk[chunk.isna().any(axis=1)].head(5))
+                                        print("\n[B] Echantillon Météo disponible :")
+                                        print(weather_df.head(5))
+                                    print(f"{'='*80}\n")
+
+                                drop_cols = [c for c in ['longitude', 'latitude', 'time', 'time_nz_flow'] if c in chunk.columns]
+                                chunk = chunk.drop(columns=drop_cols)
+                            else:
+                                print(f"[Worker {worker_id}] No weather data for chunk {chunk_idx} in {region}")
+
+                            output_queue.put({
+                                'worker_id': worker_id,
+                                'region': region,
+                                'chunk_idx': chunk_idx,
+                                'data': chunk,
+                            })
+
+                            progress_dict['total_chunks_produced'] += 1
+                            progress_dict[f'producer_{worker_id}_chunks'] = progress_dict.get(f'producer_{worker_id}_chunks', 0) + 1
+                            chunk_idx += 1
 
                 except Exception as e:
-                    print(f"[Producer {worker_id}] Error {year}-{region}: {e}")
+                    print(f"[Producer {worker_id}] Error in region {region}: {e}")
 
                 progress_dict['total_tasks_done'] = progress_dict.get('total_tasks_done', 0) + 1
 
@@ -160,6 +177,8 @@ def mount_consumer(consumer_id, input_queue, stop_event, process_func, progress_
     processed_count = 0
 
     with sqlite3.connect("./nz/data/processed/db.db") as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+
         while not stop_event.is_set():
             try:
                 item = input_queue.get(timeout=1)

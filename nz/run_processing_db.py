@@ -2,7 +2,7 @@ import multiprocessing
 import pandas as pd
 import time
 from typing import List, Tuple, Callable
-import nz.src.data_processors.test_db_struct as db_struct
+import nz.src.data_processors.test_db_struct as DBStruct
 from pathlib import Path
 
 from nz.src.data_processors.utils_pipeline import mount_worker, mount_consumer, progress_monitor
@@ -68,43 +68,43 @@ def parallel_orchestrator(db_path: str, db_path_era5: str, tasks: List[Tuple], c
         monitor_thread.join()
         manager.shutdown()
 
-def run(base_path='./nz/data/raw/'):
-    print("Initialisation...")
+def run(db_paths : dict, orchestrator_params : dict) -> None:
 
-    print(os.listdir())
+    print("Initialisation preprocessing...")
 
-    path_obj = Path(base_path)
-    db_file = path_obj / 'nz_downloads/NZDB.db'
-    db_era5_folder = path_obj / 'era5_downloads/'
-    db_era5_db = db_era5_folder / 'era5_data.db'
+    print("Launch from : ", os.listdir())
 
-    test_result = db_struct.test()
+    #db_file = Path(db_paths['nzdb'])
+    #db_era5_folder = Path(db_paths['era5db'])
 
-    db_instance = db_struct.NzStruct(str(path_obj))
+    test_result = DBStruct.test_dbs_struct()
+    if test_result:
+        print("Error while checking database structure : Structure does'nt math or db does'nt exist at path.")
+        sys.exit(-1)
+
+
+    db_instance = DBStruct.NZStruct(db_paths['nzdb'])
     metadata = db_instance.getMetadata()
 
-    db_era5_instance = db_struct.ERA5Struct(db_era5_folder)
+    unique_regions = metadata['flow_region']['region'].unique().tolist()
 
-    flow_datetime = pd.to_datetime(metadata['flow_datetime']['datetime'])
-    flow_region = metadata['flow_region']['region']
+    tasks = []
+    for region in unique_regions:
+        stations_df = db_instance.getSiterefFromRegion(region)
+        if not stations_df.empty:
+            tasks.append((region, stations_df))
 
-    tasks = [
-        (year, region)
-        for year in flow_datetime.dt.year.unique()
-        for region in flow_region.unique()
-    ]
-
-    print(f"Total Tâches: {len(tasks)}")
+    print(f"Total tasks: {len(tasks)}")
 
     parallel_orchestrator(
-        db_path=db_file,
-        db_path_era5=db_era5_db,
+        db_path=Path(db_paths['nzdb']),
+        db_path_era5=Path(db_paths['era5db']),
         tasks=tasks,
-        chunksize="100_000",
-        n_producers=1,
-        n_consumers=1,
-        process_func=None,
-        queue_maxsize=20,
+        chunksize=int(str(orchestrator_params['chunk_size']).replace("_", "")), # Sécurité si str
+        n_producers=int(orchestrator_params['n_producers']),
+        n_consumers=int(orchestrator_params['n_consumers']),
+        process_func=orchestrator_params['process_func'],
+        queue_maxsize=int(orchestrator_params['queue_maxsize']), # Conversion ici
         total_tasks=len(tasks)
     )
 
