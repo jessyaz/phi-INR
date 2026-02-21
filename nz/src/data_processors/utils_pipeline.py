@@ -50,7 +50,7 @@ def mount_worker(worker_id, tasks, db_path, db_path_era5, chunksize, output_queu
 
                         #placeholders = ','.join(['?'] * len(u_siteref_list))
                         query = f"SELECT * FROM flow WHERE SITEREF = ? ORDER BY DATETIME"
-
+#t
                         chunk_idx = 0
 
                         #for chunk in pd.read_sql(query, conn, params=[siteref]):
