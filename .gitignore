@@ -1,6 +1,6 @@
 # Default ignored files
 /shelf/
-/.idea/workspace.xml
+/.idea/*
 # Ignored default folder with query files
 /queries/
 # Datasource local storage ignored files
@@ -13,4 +13,4 @@
 
 # Repo conf
 /data/
-/.idea/
+/.idea
