@@ -1,0 +1,23 @@
+# IntelliJ files
+.idea/
+*.iml
+workspace.xml
+shelf/
+
+# NZ project data
+data/
+logs/
+tmp/
+
+nz/envs/mnt
+
+
+# Query files
+queries/
+
+# Datasource local storage
+dataSources/
+dataSources.local.xml
+
+# Editor HTTP requests
+httpRequests/
