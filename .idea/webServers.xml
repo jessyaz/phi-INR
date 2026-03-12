@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="db26b23a-5282-42fa-ab44-6a9f240a18a3" name="APT21">
+        <fileTransfer rootFolder="/home/jazizi/dev/HIND" accessType="SFTP" host="192.168.20.21" port="22" sshConfigId="d7218b9e-389a-447e-8ea7-dfb0fba5de22" sshConfig="jazizi@192.168.20.21:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" isUseRsync="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
