@@ -1,9 +1,6 @@
 from pathlib import Path
 import sys
 
-ROOT = Path(__file__).parent
-sys.path.insert(0, str(ROOT))
-
 import numpy as np
 import torch
 import joblib

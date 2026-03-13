@@ -74,3 +74,20 @@ misc:
   log_every_n_epochs: 10
   save_every_n_epochs: 1
   n_plots: 5
+
+head_lstm:
+  model:
+    hidden_dim: 64
+    lr: 1e-3
+    twin_idx: 24
+
+  data:
+    train_parquet: "data/train_data.parquet"
+    num_days: 10
+    batch_size: 32
+
+  inr:
+    latent_dim: 128
+
+  mlflow:
+    experiment_name: "LSTM_Manual_Weights"
