@@ -11,6 +11,10 @@
 
 
 *.iml
+*.xml
 
 /data/
 /save_models/
+
+
+../data/

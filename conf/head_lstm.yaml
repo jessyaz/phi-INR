@@ -1,0 +1,19 @@
+head_lstm:
+  data:
+    train_parquet: data/train_data.parquet
+    val_parquet:   data/val_data.parquet
+    num_days:      10
+    batch_size:    32
+
+  model:
+    hidden_dim:    128
+    lr:            1e-3
+    epochs:        50
+    warmup_epochs: 5
+    twin_idx:      120
+
+  inr:
+    latent_dim: 128
+
+  mlflow:
+    experiment_name: lstm_head
