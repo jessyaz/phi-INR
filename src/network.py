@@ -1,17 +1,17 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from src.film_conditionning import film_translate
+from src.head_sequencer import LSTM_HEAD
+from src.dataloaders import LSTM_IN_DIM, STAT_DIM
 
-# ── Modules auxiliaires ──────────────────────────────────────
+
+# ── Encodeur spatial Fourier ──────────────────────────────────
+
 class FourierSpatialEncoder(nn.Module):
-    def __init__(self, num_freqs=16, d_out=32, sigma=1.0):
+    def __init__(self, num_freqs=16, d_out=32, sigma=0.1):
         super().__init__()
-        # sigma contrôle l'échelle : petit = sensible aux grandes distances,
-        #                             grand = sensible aux petites distances
         B = torch.randn(2, num_freqs) * sigma
         self.register_buffer('B', B)
-
         self.mlp = nn.Sequential(
             nn.Linear(2 * num_freqs, 64),
             nn.GELU(),
@@ -19,81 +19,113 @@ class FourierSpatialEncoder(nn.Module):
         )
 
     def forward(self, latlon):
-        proj  = 2 * torch.pi * latlon @ self.B   # (B, num_freqs)
-        feats = torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)  # (B, 2*num_freqs)
+        proj  = 2 * torch.pi * latlon @ self.B
+        feats = torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
         return self.mlp(feats)
 
 
+# ── Encodeur statique complet ─────────────────────────────────
+
 class StaticEncoder(nn.Module):
-    def __init__(self, x_stat_dim, static_emb_dim):
+    """
+    lat/lon → FourierSpatialEncoder → (B, spatial_dim)
+    dir_idx → nn.Embedding          → (B, dir_dim)
+    concat                          → (B, spatial_dim + dir_dim)
+    """
+    def __init__(self, spatial_dim=32, dir_dim=8, num_directions=6, sigma=0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(x_stat_dim, static_emb_dim),
-            nn.SiLU(),
+        self.spatial_enc   = FourierSpatialEncoder(num_freqs=16, d_out=spatial_dim, sigma=sigma)
+        self.dir_embedding = nn.Embedding(num_embeddings=num_directions, embedding_dim=dir_dim)
+        self.out_dim       = spatial_dim + dir_dim
+
+    def forward(self, x_statics, dir_idx):
+        assert dir_idx.max() < self.dir_embedding.num_embeddings, (
+            f"dir_idx max={dir_idx.max().item()} >= num_directions={self.dir_embedding.num_embeddings} "
+            f"— augmente num_directions dans config.yaml"
         )
+        spatial = self.spatial_enc(x_statics.float())
+        dir_vec = self.dir_embedding(dir_idx)
+        return torch.cat([spatial, dir_vec], dim=-1)
 
-    def forward(self, x_statics):
-        return self.net(x_statics.float())
 
+# ── Hypernetwork avec contexte ────────────────────────────────
 
 class LatentToModulation(nn.Module):
-    def __init__(self, latent_dim, static_emb_dim, num_modulations):
+    """code + h_dynamics + static_emb → modulations FiLM"""
+    def __init__(self, latent_dim, lstm_hidden_dim, static_emb_dim, num_modulations):
         super().__init__()
-        self.net = nn.Linear(latent_dim * 2 + static_emb_dim, num_modulations)
+        self.net = nn.Linear(latent_dim + lstm_hidden_dim + static_emb_dim, num_modulations)
 
-    def forward(self, modulation, z_lat, static_emb):
-        return self.net(torch.cat([modulation, z_lat, static_emb], dim=1))
+    def forward(self, code, h_dynamics, static_emb):
+        return self.net(torch.cat([code, h_dynamics, static_emb], dim=-1))
 
 
-# ── Encodage positionnel (NeRF) ──────────────────────────────
+# ── Hypernetwork vanilla ──────────────────────────────────────
+
+class LatentToModulationVanilla(nn.Module):
+    """code seul → modulations (INR vanilla)"""
+    def __init__(self, latent_dim, num_modulations):
+        super().__init__()
+        self.net = nn.Linear(latent_dim, num_modulations)
+
+    def forward(self, code):
+        return self.net(code)
+
+
+# ── Encodage positionnel NeRF ─────────────────────────────────
 
 class NeRFEncoding(nn.Module):
     def __init__(self, num_frequencies, min_freq, include_input=True, input_dim=1, base_freq=1.25):
         super().__init__()
         self.include_input = include_input
-
-        bands = base_freq * torch.arange(min_freq, num_frequencies, 1, dtype=torch.float32)
-        self.bands   = nn.Parameter(bands, requires_grad=False)
-        self.out_dim = bands.shape[0] * input_dim * 2
+        bands              = base_freq * torch.arange(min_freq, num_frequencies, dtype=torch.float32)
+        self.bands         = nn.Parameter(bands, requires_grad=False)
+        self.out_dim       = bands.shape[0] * input_dim * 2
         if include_input:
-            self.out_dim += input_dim
+            self.out_dim  += input_dim
 
     def forward(self, coords):
-        # coords : (B, T, input_dim)
-        winded  = (coords[..., None, :] * self.bands[None, None, :, None])
-        winded  = winded.reshape(coords.shape[0], coords.shape[1], -1)
+        winded  = coords[..., None, :] * self.bands[None, None, :, None]
+        winded  = winded.reshape(*coords.shape[:2], -1)
         encoded = torch.cat([torch.sin(winded), torch.cos(winded)], dim=-1)
         if self.include_input:
             encoded = torch.cat([coords, encoded], dim=-1)
         return encoded
 
 
-# ── Modèle principal ─────────────────────────────────────────
+# ── Modèle principal ──────────────────────────────────────────
 
 class ModulatedFourierFeatures(nn.Module):
     def __init__(
             self,
             input_dim,
             output_dim,
-            x_dyn_c_dim,
-            x_stat_dim,
             look_back_window,
-            num_frequencies=8,
-            latent_dim=128,
-            static_emb_dim=16,
-            width=256,
-            depth=3,
-            min_frequencies=0,
-            base_frequency=1.25,
-            include_input=True,
-            is_training=True,
-            use_context=True,
+            num_frequencies  = 8,
+            latent_dim       = 128,
+            lstm_hidden_dim  = 128,
+            spatial_dim      = 32,
+            dir_dim          = 8,
+            num_directions   = 6,
+            sigma            = 0.1,
+            width            = 256,
+            depth            = 3,
+            min_frequencies  = 0,
+            base_frequency   = 1.25,
+            include_input    = True,
+            is_training      = True,
+            use_context      = True,
+            freeze_lstm      = False,
     ):
         super().__init__()
+        self.is_training     = is_training
+        self.use_context     = use_context
+        self.latent_dim      = latent_dim
+        self.lstm_hidden_dim = lstm_hidden_dim
+        self.look_back       = look_back_window
 
-        self.is_training = is_training   # NOTE: ne pas utiliser self.training (attribut PyTorch réservé)
-        self.use_context = use_context
-        self.latent_dim  = latent_dim
+
+        self._debug = False
 
         self.embedding = NeRFEncoding(
             num_frequencies = num_frequencies,
@@ -106,80 +138,174 @@ class ModulatedFourierFeatures(nn.Module):
         in_channels  = [self.embedding.out_dim] + [width] * (depth - 1)
         out_channels = [width] * (depth - 1) + [output_dim]
         self.layers  = nn.ModuleList([nn.Linear(i, o) for i, o in zip(in_channels, out_channels)])
-        self.depth   = depth
 
         num_modulations = width * (depth - 1)
 
-        self.vae = VAE(
-            input_dim  = x_dyn_c_dim,
-            latent_dim = latent_dim,
-            seq_len    = look_back_window,
+        # ── LSTM encodeur de contexte ──
+        self.lstm = LSTM_HEAD(
+            context_dim = LSTM_IN_DIM,
+            hidden_dim  = lstm_hidden_dim,
         )
-        self.static_encoder      = StaticEncoder(x_stat_dim, static_emb_dim)
-        self.latent_to_modulation = LatentToModulation(latent_dim, static_emb_dim, num_modulations)
+        if freeze_lstm:
+            for p in self.lstm.parameters():
+                p.requires_grad_(False)
+            print("[MFF] Poids LSTM gelés")
 
-    def set_context_mode(self, use_context: bool) -> None:
+        # ── Encodeur statique ──
+        self.static_encoder = StaticEncoder(
+            spatial_dim    = spatial_dim,
+            dir_dim        = dir_dim,
+            num_directions = num_directions,
+            sigma          = sigma,
+        )
+        static_emb_dim = self.static_encoder.out_dim   # spatial_dim + dir_dim
+
+        # ── Hypernetworks ──
+        self.latent_to_mod = LatentToModulation(
+            latent_dim      = latent_dim,
+            lstm_hidden_dim = lstm_hidden_dim,
+            static_emb_dim  = static_emb_dim,
+            num_modulations = num_modulations,
+        )
+        self.latent_to_mod_vanilla = LatentToModulationVanilla(
+            latent_dim      = latent_dim,
+            num_modulations = num_modulations,
+        )
+
+    def load_lstm_weights(self, ckpt_path: str, device='cpu'):
+        ckpt = torch.load(ckpt_path, map_location=device)
+        self.lstm.W.data = ckpt['model']['W']
+        self.lstm.b.data = ckpt['model']['b']
+        print(f"Poids LSTM chargés — W:{self.lstm.W.shape} b:{self.lstm.b.shape}")
+        print(f"Depuis : {ckpt_path}")
+
+    def set_context_mode(self, use_context: bool):
         self.use_context = use_context
-        mode = "with context (VAE)" if use_context else "without context (INR vanilla)"
-        print(f"[ModulatedFourierFeatures] Mode : {mode}")
+        print(f"[MFF] Mode : {'context LSTM' if use_context else 'INR vanilla'}")
 
-    def modulated_forward(self, coords, modulation, x_past, x_statics, beta=0):
-        batch_size = coords.shape[0]
+    def _inr_batch(self, coords, code, hs, x_statics, dir_idx):
+        """
+        Passe vectorisée sur T pas simultanément.
+        coords    : (B, T, 1)
+        code      : (B, latent_dim)
+        hs        : (B, T, lstm_hidden_dim)
+        x_statics : (B, STAT_DIM)
+        dir_idx   : (B,)
+        """
+        B, T, _ = coords.shape
 
-        if self.use_context:
-            mu, logvar   = self.vae.encode(x_past)
-            z_lat        = mu if not self.is_training else self.vae.reparameterize(mu, logvar)
-            recon_x_past = self.vae.decode(z_lat)
-            loss_vae     = self.vae.loss_function(recon_x_past, x_past, mu, logvar, beta=beta)
-        else:
-            z_lat    = torch.zeros(batch_size, self.latent_dim, device=coords.device, dtype=coords.dtype)
-            loss_vae = torch.tensor(0.0, device=coords.device, dtype=coords.dtype)
+        static_emb = self.static_encoder(x_statics, dir_idx)          # (B, S)
+        static_emb = static_emb.unsqueeze(1).expand(-1, T, -1)        # (B, T, S)
+        code_exp   = code.unsqueeze(1).expand(-1, T, -1)              # (B, T, latent)
 
-        static_emb  = self.static_encoder(x_statics)
-        position    = self.embedding(coords)
-        modulations = self.latent_to_modulation(modulation, z_lat, static_emb)
-        pre_out     = film_translate(position, modulations, self.layers[:-1], torch.relu)
-        out         = self.layers[-1](pre_out)
+        position   = self.embedding(coords)                            # (B, T, pos_dim)
 
-        return out, loss_vae
+        # aplatit B*T pour le linear
+        mods = self.latent_to_mod(
+            code_exp.reshape(B * T, -1),
+            hs.reshape(B * T, -1),
+            static_emb.reshape(B * T, -1),
+        )                                                              # (B*T, num_mods)
+
+        position_flat = position.reshape(B * T, 1, -1)                # (B*T, 1, pos_dim)
+        pre_out = film_translate(position_flat, mods, self.layers[:-1], torch.relu)
+        out     = self.layers[-1](pre_out)                             # (B*T, 1, 1)
+        return out.reshape(B, T, 1)
+
+    def _inr_batch_vanilla(self, coords, code):
+        """INR vanilla vectorisé — sans contexte."""
+        B, T, _ = coords.shape
+        code_exp      = code.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)
+        position_flat = self.embedding(coords).reshape(B * T, 1, -1)
+        mods          = self.latent_to_mod_vanilla(code_exp)
+        pre_out       = film_translate(position_flat, mods, self.layers[:-1], torch.relu)
+        return self.layers[-1](pre_out).reshape(B, T, 1)
+
+    def modulated_forward(self, coords_p, code, x_context_p, y_past,
+                          x_statics=None, dir_idx=None,
+                          coords_h=None, x_context_h=None, beta=0):
+        B, T_p, _ = coords_p.shape
 
 
-# ── VAE ──────────────────────────────────────────────────────
+        if self._debug == True:
+            print(f"\n[MFF.modulated_forward]")
+            print(f"  use_context  : {self.use_context}")
+            print(f"  coords_p     : {tuple(coords_p.shape)}  min={coords_p.min():.3f} max={coords_p.max():.3f}")
+            print(f"  code         : {tuple(code.shape)}  norm={code.norm():.4f}")
+            print(f"  x_context_p  : {tuple(x_context_p.shape)}  nan={x_context_p.isnan().any().item()}")
+            print(f"  y_past       : {tuple(y_past.shape)}  nan={y_past.isnan().any().item()}")
+            if x_statics is not None:
+                print(f"  x_statics    : {tuple(x_statics.shape)}  nan={x_statics.isnan().any().item()}")
+            if dir_idx is not None:
+                print(f"  dir_idx      : {tuple(dir_idx.shape)}  min={dir_idx.min().item()} max={dir_idx.max().item()}")
+            if coords_h is not None:
+                print(f"  coords_h     : {tuple(coords_h.shape)}")
+            if x_context_h is not None:
+                print(f"  x_context_h  : {tuple(x_context_h.shape)}  nan={x_context_h.isnan().any().item()}")
 
-class VAE(nn.Module):
-    def __init__(self, input_dim, latent_dim, seq_len):
-        super().__init__()
-        self.seq_len     = seq_len
-        self.input_dim   = input_dim
-        self.latent_dim  = latent_dim
-        flatten_dim      = input_dim * seq_len
+        if not self.use_context:
+            if self._debug:
+                print("  [vanilla] INR sans LSTM ni static")
+            out_p = self._inr_batch_vanilla(coords_p, code)
+            if self._debug:
+                print(f"  out_p        : {tuple(out_p.shape)}  nan={out_p.isnan().any().item()}")
+            out_h = None
+            if coords_h is not None:
+                out_h = self._inr_batch_vanilla(coords_h, code)
+                if self._debug:
+                    print(f"  out_h        : {tuple(out_h.shape)}  nan={out_h.isnan().any().item()}")
+            return out_p, out_h, torch.tensor(0.0, device=coords_p.device)
 
-        self.encoder_net = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flatten_dim, 1024), nn.ReLU(),
-            nn.Linear(1024, 256),         nn.ReLU(),
-        )
-        self.fc_mu     = nn.Linear(256, latent_dim)
-        self.fc_logvar = nn.Linear(256, latent_dim)
+        # ── Contexte LSTM ─────────────────────────────────────────
+        assert dir_idx   is not None, "dir_idx requis quand use_context=True"
+        assert x_statics is not None, "x_statics requis quand use_context=True"
 
-        self.decoder_net = nn.Sequential(
-            nn.Linear(latent_dim, 256), nn.ReLU(),
-            nn.Linear(256, 256),        nn.ReLU(),
-            nn.Linear(256, 256),        nn.ReLU(),
-            nn.Linear(256, flatten_dim),
-        )
+        if self._debug:
+            print("  [context] LSTM forward_past...")
+        hs_p, h_final, c_final = self.lstm.forward_past(x_context_p, y_past)
 
-    def encode(self, x):
-        h = self.encoder_net(x)
-        return self.fc_mu(h), self.fc_logvar(h)
+        if self._debug:
+            print(f"  hs_p         : {tuple(hs_p.shape)}  nan={hs_p.isnan().any().item()}  norm={hs_p.norm():.4f}")
+            print(f"  h_final      : {tuple(h_final.shape)}  nan={h_final.isnan().any().item()}")
+            print("  [context] _inr_batch série P...")
+        out_p = self._inr_batch(coords_p, code, hs_p, x_statics, dir_idx)
 
-    def reparameterize(self, mu, logvar):
-        return mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+        if self._debug:
+            print(f"  out_p        : {tuple(out_p.shape)}  nan={out_p.isnan().any().item()}  "
+                  f"min={out_p.min():.4f} max={out_p.max():.4f}")
 
-    def decode(self, z):
-        return self.decoder_net(z).view(-1, self.seq_len, self.input_dim)
+        out_h = None
+        if coords_h is not None:
+            if self._debug:
+                print(f"  [context] série H AR — {coords_h.shape[1]} pas...")
+            T_h       = coords_h.shape[1]
+            h, c      = h_final, c_final
+            last_flow = out_p[:, -1, :]
+            hs_h      = []
 
-    def loss_function(self, recon_x, x, mu, logvar, beta=1e-4):
-        mse = F.mse_loss(recon_x, x, reduction='mean') / x.size(0)
-        kl  = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
-        return mse + beta * kl
+            for t in range(T_h):
+                h_since = torch.full((B, 1), (t + 1) / 24.0, device=coords_h.device)
+                x_in    = torch.cat([x_context_h[:, t, :], last_flow, h_since], dim=-1)
+
+                if x_in.isnan().any():
+                    print(f"    ⚠ NaN dans x_in à t={t}  last_flow nan={last_flow.isnan().any().item()}")
+
+                h, c = self.lstm.cell_step(x_in, h, c)
+
+                if h.isnan().any():
+                    print(f"    ⚠ NaN dans h à t={t}")
+                    break
+
+                hs_h.append(h.unsqueeze(1))
+
+            hs_h = torch.cat(hs_h, dim=1)
+            if self._debug:
+                print(f"  hs_h         : {tuple(hs_h.shape)}  nan={hs_h.isnan().any().item()}  norm={hs_h.norm():.4f}")
+
+            out_h = self._inr_batch(coords_h, code, hs_h, x_statics, dir_idx)
+            if self._debug:
+                print(f"  out_h        : {tuple(out_h.shape)}  nan={out_h.isnan().any().item()}  "
+                  f"min={out_h.min():.4f} max={out_h.max():.4f}")
+        if self._debug:
+            print("[MFF.modulated_forward] ✓ done\n")
+        return out_p, out_h, torch.tensor(0.0, device=coords_p.device)

@@ -13,6 +13,11 @@ COL_STATIC    = ['LAT', 'LON']
 COL_TARGET    = 'FLOW'
 WEIGHT_TARGET = 0
 
+X_TIME_DIM  = 3   # dow_sin, dow_cos, is_holiday
+METEO_DIM   = len(COL_METEO)
+LSTM_IN_DIM = METEO_DIM + X_TIME_DIM
+STAT_DIM    = len(COL_STATIC)
+
 # ── Scaler ───────────────────────────────────────────────────
 
 class StandardScaler:
@@ -123,7 +128,6 @@ class NZDataset(Dataset):
                 serie['IS_HOLIDAY'].values,
             ], axis=-1).astype('float32')
 
-            # Découpe en fenêtres non-chevauchantes alignées sur la série
             t = np.linspace(-1, 1, self.window_h, dtype='float32').reshape(-1, 1)
 
             for start in range(0, series_len - self.window_h + 1, self.window_h):

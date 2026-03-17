@@ -2,92 +2,71 @@ defaults:
   - _self_
 
 meta:
-  experiment_pack: "TEST_1203"
+  experiment_pack: INR_TEST
 
-# ── Données ──────────────────────────────────────────────────
-data:
-  dataset_name: NZ
-  train_parquet: "data/train_data.parquet"
-  test_parquet:  "data/test_data.parquet"
-  num_days: "10D"
-  look_back_window: 192
-  horizon: 48
-  input_dim: 1
-  output_dim: 1
-  x_dyn_c_dim: 11
-  x_stat_dim: 1
-  num_workers: 4
-  pin_memory: true
 
-# ── Optimisation ─────────────────────────────────────────────
-optim:
-  epochs: 250
-  batch_size: 32
-  lr_inr: 1.0e-4
-  lr_code: 1.0e-4
-  weight_decay: 1.0e-5
-  clip_grad_value: 1.0
-  scheduler: cosine
-  t_max: 3000
+inference:
+  ckpt:    save_models/inr/context_scratch/delightful-cow-964_20260313_1714_best.pt
 
-# ── Inner loop ───────────────────────────────────────────────
-inner:
-  inner_steps: 200
-  w_passed: 0.2
-  w_futur: 0.8
+  # VANILLA - save_models/inr/vanilla/sneaky-stag-351_20260313_1714_best.pt
 
-# ── VAE ──────────────────────────────────────────────────────
-vae:
-  beta_start: 0.0
-  beta_end: 1.0e-4
-  beta_warmup_epochs: 200
-  lambda_vae: 0.1
+  # FREEZE - save_models/inr/INR_LSTM_FREEZE/delicate-panda-635_20260316_1057_best.pt
+  # NON FREEZE - save_models/inr/INR_LSTM_FREEZE/delightful-stag-610_20260316_1057_best.pt
 
-# ── Pré-entraînement VAE ─────────────────────────────────────
-pretrain_vae:
-  epochs: 200
-  lr: 1.0e-3
-  beta_warmup_epochs: 50
-  patience: 100
-  early_stop_threshold: 1.0e-5
+  #null   # null = dernier _best.pt  |  "save_models/inr/run_xxx_best.pt"
+  n_plots: 8
 
-# ── INR ──────────────────────────────────────────────────────
-inr:
-  hidden_dim: 256
-  depth: 3
-  latent_dim: 128
-  static_emb_dim: 16
-  num_frequencies: 8
-  min_frequencies: 0
-  base_frequency: 1.25
-  include_input: true
-  use_context: true
 
-# ── Chemins ──────────────────────────────────────────────────
 paths:
-  save_models:  "save_models"
-  scalers_file: "save_models/scalers.pkl"
+  save_models:  save_models/inr
+  scalers_file: save_models/inr/scalers.pkl
 
-# ── Divers ───────────────────────────────────────────────────
+data:
+  train_parquet:    data/train_data.parquet
+  val_parquet:      data/val_data.parquet
+  test_parquet:     data/test_data.parquet
+  dataset_name:     nz
+  input_dim:        1       # dimension coords temporelles
+  output_dim:       1       # flow
+  look_back_window: 192     # heures observation (serie_p)
+  horizon:          48     # heures prédiction  (serie_h)
+  num_workers:      1
+  pin_memory:       true
+
+inr:
+  use_context:      true    # false = INR vanilla (sans LSTM ni static)
+  freeze_lstm:      false   # true = gèle poids LSTM
+  lstm_ckpt:        save_models/head_lstm/debonair-wolf-926_h256_20260316_1006_best.pt # null    # "save_models/head_lstm/run_xxx_best.pt" ou null
+  lstm_hidden_dim:  256
+  latent_dim:       256
+  num_frequencies:  8
+  min_frequencies:  0
+  hidden_dim:       256
+  depth:            3
+  base_frequency:   1.25
+  include_input:    true
+  static:
+    spatial_dim:    128      # sortie FourierSpatialEncoder
+    dir_dim:        8       # sortie nn.Embedding direction
+    num_directions: 7       # nb directions distinctes
+    sigma:          0.1     # échelle Fourier (0.1 = sensible grandes distances)
+
+optim:
+  lr_inr:           1.0e-4
+  lr_code:          1.0e-2
+  weight_decay:     1.0e-5
+  batch_size:       32
+  epochs:           200
+  scheduler:        cosine  # cosine | null
+  t_max:            200
+  clip_grad_value:  1.0
+
+inner:
+  inner_steps:      3
+  w_passed:         1.0
+  w_futur:          1.0
+
 misc:
-  version: 2
-  log_every_n_epochs: 10
-  save_every_n_epochs: 1
-  n_plots: 5
-
-head_lstm:
-  model:
-    hidden_dim: 64
-    lr: 1e-3
-    twin_idx: 24
-
-  data:
-    train_parquet: "data/train_data.parquet"
-    num_days: 10
-    batch_size: 32
-
-  inr:
-    latent_dim: 128
-
-  mlflow:
-    experiment_name: "LSTM_Manual_Weights"
+  log_every_n_epochs:  10
+  save_every_n_epochs: 10
+  version:             1

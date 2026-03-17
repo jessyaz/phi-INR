@@ -61,6 +61,48 @@ class LSTM_HEAD(nn.Module):
         return torch.cat(preds, dim=1)   # (B, T-1, 1)
 
 
+    def forward_past(self, x_context, y_flow):
+        """
+        Encodeur série P pour l'INR — teacher forcing.
+        x_context : (B, T, context_dim)  meteo + x_time
+        y_flow    : (B, T, 1)
+        Retourne  : hs (B, T, H), h_final, c_final
+        """
+        B, T, _ = x_context.shape
+        h = torch.zeros(B, self.hidden_dim, device=x_context.device)
+        c = torch.zeros(B, self.hidden_dim, device=x_context.device)
+        hs = []
+        for t in range(T):
+            x_in = torch.cat([
+                x_context[:, t, :],
+                y_flow[:, t, :],
+                torch.zeros(B, 1, device=x_context.device),
+            ], dim=-1)
+            h, c = self.cell_step(x_in, h, c)
+            hs.append(h.unsqueeze(1))
+        return torch.cat(hs, dim=1), h, c
+
+    def forward_horizon(self, x_context, h_init, c_init, flow_init, inr_pred_fn):
+        """
+        Encodeur série H pour l'INR — auto-régressif.
+        Reinjecte le flow prédit par l'INR à chaque pas.
+        inr_pred_fn : callable(h_t: (B, H)) → flow (B, 1)
+        Retourne    : hs (B, T, H)
+        """
+        B, T, _ = x_context.shape
+        h, c    = h_init, c_init
+        last_flow = flow_init
+        hs = []
+        for t in range(T):
+            h_since = torch.full((B, 1), (t + 1) / 24.0, device=x_context.device)
+            x_in    = torch.cat([x_context[:, t, :], last_flow, h_since], dim=-1)
+            h, c    = self.cell_step(x_in, h, c)
+            hs.append(h.unsqueeze(1))
+            last_flow = inr_pred_fn(h)
+        return torch.cat(hs, dim=1)
+
+
+
 def warmup_cosine(warmup_epochs, total_epochs):
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
@@ -99,7 +141,7 @@ def run_epoch(model, loader, criterion, twin_idx, optimizer=None):
         pbar = tqdm(loader, leave=False, desc="train" if training else "val ")
         for batch in pbar:
             t_pts, _, _, x_meteo, x_time, y, _ = batch
-            x_dyn = torch.cat([x_meteo, x_time, t_pts.float()], dim=-1).to(DEVICE)
+            x_dyn = torch.cat([x_meteo, x_time], dim=-1).to(DEVICE)
             y     = y.to(DEVICE)
 
             preds            = model(x_dyn, y, twin_idx=twin_idx)
@@ -125,14 +167,13 @@ def main(cfg: DictConfig):
     conf = cfg.head_lstm
     print(f"Device : {DEVICE}")
 
-    trainset = NZDataset(ROOT / conf.data.train_parquet, mode='train', latent_dim=conf.inr.latent_dim)
-    valset   = NZDataset(ROOT / conf.data.val_parquet,   mode='val',   latent_dim=conf.inr.latent_dim,
-                         scalers=trainset.scalers)
+    trainset = NZDataset(ROOT / conf.data.train_parquet, mode='train', latent_dim=conf.model.hidden_dim)
+    valset   = NZDataset(ROOT / conf.data.val_parquet,   mode='val',   latent_dim=conf.model.hidden_dim, scalers=trainset.scalers)
 
     train_loader = DataLoader(trainset, batch_size=conf.data.batch_size, shuffle=True,  num_workers=4)
     val_loader   = DataLoader(valset,   batch_size=conf.data.batch_size, shuffle=False, num_workers=4)
 
-    model     = LSTM_HEAD(13, conf.model.hidden_dim).to(DEVICE)
+    model     = LSTM_HEAD(conf.model.context_dim, conf.model.hidden_dim).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=conf.model.lr)
     criterion = nn.MSELoss()
     scheduler = LambdaLR(optimizer, lr_lambda=warmup_cosine(conf.model.warmup_epochs, conf.model.epochs))
@@ -141,7 +182,6 @@ def main(cfg: DictConfig):
     save_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 
-    # Sauvegarde scalers une seule fois
     joblib.dump(trainset.scalers, save_dir / 'scalers.pkl')
     print(f"Scalers sauvegardés : {save_dir / 'scalers.pkl'}")
 
@@ -175,7 +215,7 @@ def main(cfg: DictConfig):
 
             if va < best_val:
                 best_val  = va
-                ckpt_path = save_dir / f"{run_name}_{timestamp}_best.pt"
+                ckpt_path = save_dir / f"{run_name}_h{conf.model.hidden_dim}_{timestamp}_best.pt"
                 torch.save({
                     'epoch':      epoch,
                     'model':      model.state_dict(),

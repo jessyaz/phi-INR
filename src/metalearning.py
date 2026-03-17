@@ -1,62 +1,99 @@
 import torch
 import torch.nn as nn
 
-# ── Inner loop ───────────────────────────────────────────────
 
-def inner_loop(func_rep, modulations, coords, features, x_statics, y_target, inner_steps, inner_lr):
-    for _ in range(inner_steps):
-        modulations = inner_loop_step(
-            func_rep, modulations, coords, features, x_statics, y_target, inner_lr
-        )
-    return modulations
-
-
-def inner_loop_step(func_rep, modulations, coords, features, x_statics, y_target, inner_lr):
-    loss_fn = nn.MSELoss(reduction="mean")
-
+def inner_loop_step(func_rep, code, coords, hs_p, x_statics, dir_idx, y_past, inner_lr):
+    loss_fn = nn.MSELoss()
     with torch.enable_grad():
-        y_hat, _ = func_rep.modulated_forward(coords, modulations, features, x_statics)
-        loss     = loss_fn(y_hat, y_target)
-        grad     = torch.autograd.grad(loss, modulations, create_graph=False)[0]
+        code  = code.detach().requires_grad_(True)
+        out_p = func_rep._inr_batch(coords, code, hs_p, x_statics, dir_idx) \
+            if func_rep.use_context \
+            else func_rep._inr_batch_vanilla(coords, code)
+        loss = loss_fn(out_p, y_past)
+        grad = torch.autograd.grad(loss, code, create_graph=False)[0]
+    return (code - inner_lr * grad).detach()
 
-    return modulations - inner_lr * grad
 
+def inner_loop(func_rep, code, coords, hs_p, x_statics, dir_idx, y_past,
+               inner_steps, inner_lr):
+    for _ in range(inner_steps):
+        code = inner_loop_step(
+            func_rep, code, coords, hs_p, x_statics, dir_idx, y_past, inner_lr
+        )
+    return code
 
-# ── Outer step ───────────────────────────────────────────────
 
 def outer_step(
         func_rep,
-        coords_p,
-        coords_h,
-        features_p,
-        x_statics,
-        y_target_p,
-        y_target_h,
-        inner_steps,
-        inner_lr,
-        w_passed,
-        w_futur,
-        is_train=False,
-        modulations=0,
-        beta=0,
+        coords_p, coords_h,
+        x_context_p, x_context_h,
+        y_past, y_horizon,
+        inner_steps, inner_lr,
+        w_passed, w_futur,
+        is_train  = False,
+        code      = None,
+        x_statics = None,
+        dir_idx   = None,
+        beta      = 0,
 ):
-    loss_fn = nn.MSELoss(reduction="none")
-
+    loss_fn = nn.MSELoss()
     func_rep.zero_grad()
-    modulations = modulations.requires_grad_()
 
-    modulations = inner_loop(
-        func_rep, modulations, coords_p, features_p,
-        x_statics, y_target_p, inner_steps, inner_lr,
+    B = coords_p.shape[0]
+    if code is None:
+        code = torch.zeros(B, func_rep.latent_dim, device=coords_p.device)
+    code = code.detach().requires_grad_(True)
+
+    # ── Précalcul hs_p une seule fois (LSTM fixe pendant inner loop) ──
+    if func_rep.use_context:
+        with torch.no_grad():
+            hs_p, h_final, c_final = func_rep.lstm.forward_past(x_context_p, y_past)
+    else:
+        hs_p, h_final, c_final = None, None, None
+
+    # ── Inner loop — seul code évolue ────────────────────────
+    code = inner_loop(
+        func_rep, code, coords_p, hs_p,
+        x_statics, dir_idx, y_past,
+        inner_steps, inner_lr,
     )
 
+    # ── Outer forward complet ─────────────────────────────────
     with torch.set_grad_enabled(is_train):
-        y_hat_p, _ = func_rep.modulated_forward(coords_p, modulations, features_p, x_statics, beta=beta)
-        y_hat_h, _ = func_rep.modulated_forward(coords_h, modulations, features_p, x_statics, beta=beta)
 
-        loss = (w_passed * loss_fn(y_hat_p, y_target_p) + w_futur * loss_fn(y_hat_h, y_target_h)).mean()
+        if func_rep.use_context:
+            # Recalcul avec grad pour l'outer loss
+            hs_p, h_final, c_final = func_rep.lstm.forward_past(x_context_p, y_past)
+            out_p = func_rep._inr_batch(coords_p, code, hs_p, x_statics, dir_idx)
+
+            out_h = None
+            if coords_h is not None:
+                T_h       = coords_h.shape[1]
+                h, c      = h_final, c_final
+                last_flow = out_p[:, -1, :]
+                hs_h      = []
+                for t in range(T_h):
+                    h_since = torch.full((B, 1), (t + 1) / 24.0, device=coords_h.device)
+                    x_in    = torch.cat([x_context_h[:, t, :], last_flow, h_since], dim=-1)
+                    h, c    = func_rep.lstm.cell_step(x_in, h, c)
+                    hs_h.append(h.unsqueeze(1))
+                hs_h  = torch.cat(hs_h, dim=1)
+                out_h = func_rep._inr_batch(coords_h, code, hs_h, x_statics, dir_idx)
+        else:
+            out_p = func_rep._inr_batch_vanilla(coords_p, code)
+            out_h = func_rep._inr_batch_vanilla(coords_h, code) \
+                if coords_h is not None else None
+
+        loss_p = loss_fn(out_p, y_past)
+        loss_h = loss_fn(out_h, y_horizon) if out_h is not None \
+            else torch.tensor(0.0, device=coords_p.device)
+        loss   = w_passed * loss_p + w_futur * loss_h
 
     return {
-        "loss":        loss,
-        "modulations": modulations,
+        'loss':   loss,
+        'loss_p': loss_p,
+        'loss_h': loss_h,
+        'code':   code.detach(),
+        'out_p':  out_p.detach(),
+        'out_h':  out_h.detach() if out_h is not None else None,
     }

@@ -1,19 +1,22 @@
+defaults:
+  - _self_
+
 head_lstm:
   data:
     train_parquet: data/train_data.parquet
     val_parquet:   data/val_data.parquet
-    num_days:      10
     batch_size:    32
 
   model:
-    hidden_dim:    128
-    lr:            1e-3
+    context_dim:   12      # LSTM_IN_DIM = meteo(9) + x_time(3)
+    hidden_dim:    256
+    lr:            1.0e-3
     epochs:        50
     warmup_epochs: 5
-    twin_idx:      120
+    twin_idx:      192     # frontière serie_p / serie_h
 
   inr:
-    latent_dim: 128
+    latent_dim: 256        # pour NZDataset.z
 
   mlflow:
-    experiment_name: lstm_head
+    experiment_name: head_lstm

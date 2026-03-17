@@ -1,6 +1,9 @@
 from pathlib import Path
 import sys
 
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+
 import numpy as np
 import torch
 import joblib
@@ -19,107 +22,129 @@ from src.network import ModulatedFourierFeatures
 
 # ── Helpers ──────────────────────────────────────────────────
 
-def load_checkpoint(path: str) -> dict:
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    print(f"Checkpoint chargé : epoch {ckpt['epoch']}, train_loss {ckpt['train_loss']:.6f}")
-    return ckpt
+def load_checkpoint(cfg) -> tuple[dict, Path]:
+    """Charge le checkpoint spécifié ou le dernier sauvegardé."""
+    save_dir = ROOT / cfg.paths.save_models
+
+    manual = cfg.get('inference', {}).get('ckpt', None)
+    if manual:
+        ckpt_path = Path(manual)
+    else:
+        candidates = sorted(save_dir.glob('*_best.pt'))
+        if not candidates:
+            raise FileNotFoundError(f"Aucun checkpoint trouvé dans {save_dir}")
+        ckpt_path = candidates[-1]
+
+    print(f"Checkpoint : {ckpt_path.name}")
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    print(f"  epoch      : {ckpt['epoch']}")
+    print(f"  val_loss   : {ckpt['val_loss']:.6f}")
+    print(f"  val_loss_p : {ckpt['val_loss_p']:.6f}")
+    print(f"  val_loss_h : {ckpt['val_loss_h']:.6f}")
+    return ckpt, ckpt_path
 
 
-def build_model_from_checkpoint(ckpt: dict, cfg: DictConfig, device):
-    inr_cfg  = OmegaConf.create(ckpt["cfg_inr"])
-    data_cfg = OmegaConf.create(ckpt["cfg_data"])
+def build_model_from_checkpoint(ckpt: dict, cfg: DictConfig, device) -> ModulatedFourierFeatures:
+    inr_cfg  = OmegaConf.create(ckpt['cfg_inr'])
+    data_cfg = OmegaConf.create(ckpt['cfg_data'])
 
     assert data_cfg.look_back_window == cfg.data.look_back_window, (
-        f"look_back_window mismatch : checkpoint={data_cfg.look_back_window}, config={cfg.data.look_back_window}"
+        f"look_back_window mismatch : ckpt={data_cfg.look_back_window} "
+        f"config={cfg.data.look_back_window}"
     )
 
     inr = ModulatedFourierFeatures(
         input_dim        = cfg.data.input_dim,
         output_dim       = cfg.data.output_dim,
-        x_dyn_c_dim      = cfg.data.x_dyn_c_dim,
-        x_stat_dim       = cfg.data.x_stat_dim,
         look_back_window = cfg.data.look_back_window,
         num_frequencies  = inr_cfg.num_frequencies,
         latent_dim       = inr_cfg.latent_dim,
-        static_emb_dim   = inr_cfg.static_emb_dim,
+        lstm_hidden_dim  = inr_cfg.lstm_hidden_dim,
+        spatial_dim      = inr_cfg.static.spatial_dim,
+        dir_dim          = inr_cfg.static.dir_dim,
+        num_directions   = inr_cfg.static.num_directions,
+        sigma            = inr_cfg.static.sigma,
         width            = inr_cfg.hidden_dim,
         depth            = inr_cfg.depth,
         min_frequencies  = inr_cfg.min_frequencies,
         base_frequency   = inr_cfg.base_frequency,
         include_input    = inr_cfg.include_input,
         is_training      = False,
-        use_context      = cfg.inr.use_context,
+        use_context      = inr_cfg.use_context,
+        freeze_lstm      = False,
     )
 
-    sd = ckpt.get("inr_state_dict")
-    if sd is None:
-        raise KeyError(f"'inr_state_dict' introuvable. Clés disponibles : {list(ckpt.keys())}")
-
-    inr.load_state_dict(sd)
+    inr.load_state_dict(ckpt['inr_state_dict'])
     inr = inr.to(device).eval()
-    mode = "avec contexte (VAE)" if cfg.inr.use_context else "sans contexte (INR seul)"
-    print(f"Modèle chargé en mode : {mode}")
+    print(f"Modèle chargé — mode : {'context LSTM' if inr_cfg.use_context else 'INR vanilla'}")
     return inr
 
 
-def build_html_report(plot_samples, all_mae, cfg, ckpt, look_back, horizon) -> str:
+def build_html_report(plot_samples, all_mae, cfg, ckpt, ckpt_path, look_back, horizon) -> str:
     use_context = cfg.inr.use_context
     n      = len(plot_samples)
-    label  = "avec contexte" if use_context else "sans contexte"
+    label  = "avec contexte LSTM" if use_context else "INR vanilla"
     colors = {"past": "royalblue", "target": "seagreen", "forecast": "crimson"}
 
     fig = make_subplots(
         rows=n, cols=1, shared_xaxes=False,
-        subplot_titles=[f"Sample {i + 1}" for i in range(n)],
+        subplot_titles=[f"Sample {i+1}  —  MAE={mae(s['target'], s['forecast']):.4f}"
+                        for i, s in enumerate(plot_samples)],
         vertical_spacing=0.06,
     )
 
     for i, s in enumerate(plot_samples):
-        row   = i + 1
-        x_p   = np.arange(len(s["past"]))
-        x_h   = np.arange(len(s["past"]), len(s["past"]) + len(s["target"]))
-        s_mae = mae(s["target"], s["forecast"])
+        row = i + 1
+        x_p = np.arange(len(s['past']))
+        x_h = np.arange(len(s['past']), len(s['past']) + len(s['target']))
 
-        fig.add_trace(go.Scatter(x=x_p, y=s["past"], mode="lines",
-                                 name="Passé", legendgroup="past",
-                                 showlegend=(i == 0), line=dict(color=colors["past"], width=1.5)),
+        fig.add_trace(go.Scatter(x=x_p, y=s['past'], mode='lines',
+                                 name='Passé', legendgroup='past',
+                                 showlegend=(i == 0),
+                                 line=dict(color=colors['past'], width=1.5)),
                       row=row, col=1)
-        fig.add_trace(go.Scatter(x=x_h, y=s["target"], mode="lines",
-                                 name="Cible", legendgroup="target",
-                                 showlegend=(i == 0), line=dict(color=colors["target"], width=1.5)),
+        fig.add_trace(go.Scatter(x=x_p, y=s['pred_p'], mode='lines',
+                                 name='Reconstruit P', legendgroup='pred_p',
+                                 showlegend=(i == 0),
+                                 line=dict(color='orange', width=1.2, dash='dot')),
                       row=row, col=1)
-        fig.add_trace(go.Scatter(x=x_h, y=s["forecast"], mode="lines",
-                                 name="Prédiction", legendgroup="forecast",
-                                 showlegend=(i == 0), line=dict(color=colors["forecast"], width=1.5, dash="dash")),
+        fig.add_trace(go.Scatter(x=x_h, y=s['target'], mode='lines',
+                                 name='Cible', legendgroup='target',
+                                 showlegend=(i == 0),
+                                 line=dict(color=colors['target'], width=1.5)),
                       row=row, col=1)
-        fig.add_vline(x=len(s["past"]) - 0.5, line_dash="dot", line_color="grey", opacity=0.5, row=row, col=1)
-        fig.add_annotation(xref="x domain", yref="y domain", x=0.99, y=0.97,
-                           text=f"MAE = {s_mae:.4f}", showarrow=False,
-                           font=dict(size=11), bgcolor="rgba(255,255,255,0.7)",
-                           align="right", row=row, col=1)
+        fig.add_trace(go.Scatter(x=x_h, y=s['forecast'], mode='lines',
+                                 name='Prédiction', legendgroup='forecast',
+                                 showlegend=(i == 0),
+                                 line=dict(color=colors['forecast'], width=1.5, dash='dash')),
+                      row=row, col=1)
+        fig.add_vline(x=len(s['past']) - 0.5,
+                      line_dash='dot', line_color='grey', opacity=0.5,
+                      row=row, col=1)
 
     fig.update_layout(
         height=350 * n,
         title=dict(text=(
-            f"<b>Inférence – {cfg.data.dataset_name} ({label})</b><br>"
-            f"<span style='font-size:14px'>"
-            f"Mean MAE : {np.mean(all_mae):.6f} | "
-            f"look-back : {look_back} | horizon : {horizon} | "
-            f"inner steps : {cfg.inner.inner_steps}</span>"
+            f"<b>Inférence — {cfg.data.dataset_name} ({label})</b><br>"
+            f"<span style='font-size:13px'>"
+            f"Mean MAE : {np.mean(all_mae):.6f}  |  "
+            f"look-back : {look_back}  |  horizon : {horizon}  |  "
+            f"inner steps : {cfg.inner.inner_steps}  |  "
+            f"ckpt : {ckpt_path.name}</span>"
         ), x=0.5),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
-        template="plotly_white",
+        legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='right', x=1),
+        template='plotly_white',
     )
 
-    plt_div   = plot(fig, output_type="div", include_plotlyjs=True)
-    badge_bg  = "#d4edda" if use_context else "#fff3cd"
-    badge_col = "#155724" if use_context else "#856404"
+    plt_div   = plot(fig, output_type='div', include_plotlyjs=True)
+    badge_bg  = '#d4edda' if use_context else '#fff3cd'
+    badge_col = '#155724' if use_context else '#856404'
 
     return f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
-    <title>Inférence – {cfg.data.dataset_name}</title>
+    <title>Inférence — {cfg.data.dataset_name}</title>
     <style>
         body {{ font-family: Arial, sans-serif; margin: 20px; background: #f8f9fa; }}
         .summary {{
@@ -149,8 +174,7 @@ def build_html_report(plot_samples, all_mae, cfg, ckpt, look_back, horizon) -> s
     </div>
     {plt_div}
 </body>
-</html>
-"""
+</html>"""
 
 
 # ── Main ─────────────────────────────────────────────────────
@@ -160,112 +184,120 @@ def main(cfg: DictConfig) -> None:
     look_back   = cfg.data.look_back_window
     horizon     = cfg.data.horizon
     use_context = cfg.inr.use_context
+    device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model_path = (
-        f"{cfg.paths.save_models}/models_forecasting"
-        f"_{cfg.data.dataset_name}_{horizon}_{use_context}"
-        f"_{cfg.meta.experiment_pack}_{cfg.optim.epochs}_{cfg.misc.version}.pt"
-    )
-    ckpt = load_checkpoint(model_path)
+    print(f"Device      : {device}")
+    print(f"use_context : {use_context}")
 
-    scaler_path = ROOT / cfg.paths.scalers_file
-    scalers     = joblib.load(scaler_path) if scaler_path.exists() else None
-    if scalers is None:
-        print("WARNING : scalers introuvables.")
+    ckpt, ckpt_path = load_checkpoint(cfg)
+
+    scalers = joblib.load(ROOT / cfg.paths.scalers_file)
+    print(f"Scalers chargés : {ROOT / cfg.paths.scalers_file}")
 
     # ── Dataset ──────────────────────────────────────────────
     testset = NZDataset(
         parquet_file = ROOT / cfg.data.test_parquet,
-        num_days     = cfg.data.num_days,
-        mode         = "test" if scalers is not None else "train",
+        mode         = 'test',
         scalers      = scalers,
         latent_dim   = cfg.inr.latent_dim,
     )
-    test_loader = DataLoader(
-        testset,
-        batch_size  = cfg.optim.batch_size,
-        shuffle     = False,
-        num_workers = cfg.data.num_workers,
-        pin_memory  = cfg.data.pin_memory,
-    )
+    test_loader = DataLoader(testset, batch_size=cfg.optim.batch_size,
+                             shuffle=False, num_workers=0)
 
     # ── Modèle ───────────────────────────────────────────────
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device : {device}")
     inr   = build_model_from_checkpoint(ckpt, cfg, device)
     alpha = torch.tensor([cfg.optim.lr_code], device=device)
 
     # ── Inférence ────────────────────────────────────────────
     all_mae      = []
     plot_samples = []
-    n_plots_max  = cfg.misc.get("n_plots", 5)
+    n_plots_max  = cfg.get('inference', {}).get('n_plots', 8)
 
-    for x_time, x_statics, x_dynamics, y_target, modulations in test_loader:
-        x_time      = x_time.to(device)
-        x_statics   = x_statics.to(device)
-        x_dynamics  = x_dynamics.to(device)
-        y_target    = y_target.to(device)
-        modulations = modulations.to(device)
+    for batch in test_loader:
+        t, dir_idx, x_static, x_meteo, x_time, y, code = batch
 
-        coords_p  = x_time[:, :look_back, :]
-        coords_h  = x_time[:, look_back:, :]
-        features  = x_dynamics[:, :look_back, :]
-        y_past    = y_target[:, :look_back, :]
-        y_horizon = y_target[:, look_back:, :]
+        x_context = torch.cat([x_meteo, x_time], dim=-1).to(device)
+        y_target  = y.to(device)
+        t         = t.to(device)
+
+        x_statics = x_static.to(device) if use_context else None
+        dir_idx   = dir_idx.to(device)  if use_context else None
+
+        coords_p    = t[:, :look_back, :]
+        coords_h    = t[:, look_back:, :]
+        x_context_p = x_context[:, :look_back, :]
+        x_context_h = x_context[:, look_back:, :]
+        y_past      = y_target[:, :look_back, :]
+        y_horizon   = y_target[:, look_back:, :]
 
         outputs = outer_step(
             func_rep    = inr,
             coords_p    = coords_p,
             coords_h    = coords_h,
-            features_p  = features,
-            x_statics   = x_statics,
-            y_target_p  = y_past,
-            y_target_h  = y_horizon,
+            x_context_p = x_context_p,
+            x_context_h = x_context_h,
+            y_past      = y_past,
+            y_horizon   = y_horizon,
             inner_steps = cfg.inner.inner_steps,
             inner_lr    = alpha,
             w_passed    = cfg.inner.w_passed,
             w_futur     = cfg.inner.w_futur,
             is_train    = False,
-            modulations = torch.zeros_like(modulations),
+            code        = torch.zeros(t.shape[0], cfg.inr.latent_dim, device=device),
+            x_statics   = x_statics,
+            dir_idx     = dir_idx,
         )
 
-        modulations_opt = outputs["modulations"].detach()
+        out_p = outputs['out_p']
+        out_h = outputs['out_h']
 
-        with torch.no_grad():
-            forecast, _ = inr.modulated_forward(coords_h, modulations_opt, features, x_statics)
+        # ── Dénormalisation ───────────────────────────────────
+        scaler = scalers['target']
+        std    = scaler.std.squeeze()
+        mean   = scaler.mean.squeeze()
+        eps    = scaler.eps
 
-        # ── Inverse transform ────────────────────────────────
-        y_np   = y_horizon.cpu().numpy()
-        fc_np  = forecast.cpu().numpy()
-        if scalers is not None:
-            y_np  = scalers["Y_target"].inverse_transform(y_np.reshape(-1, 1)).reshape(y_np.shape)
-            fc_np = scalers["Y_target"].inverse_transform(fc_np.reshape(-1, 1)).reshape(fc_np.shape)
+        def denorm(arr):
+            return arr * (std + eps) + mean
+
+        y_p_np  = denorm(y_past   [:, :, 0].cpu().numpy())
+        y_np    = denorm(y_horizon[:, :, 0].cpu().numpy())
+        pred_p  = denorm(out_p    [:, :, 0].cpu().numpy())
+        fc_np   = denorm(out_h    [:, :, 0].cpu().numpy()) \
+            if out_h is not None else np.zeros_like(y_np)
+
+        # ── Debug premier batch ───────────────────────────────
+        if len(all_mae) == 0:
+            print("\n── Debug premier batch ──────────────────────────")
+            for i in range(min(3, y_p_np.shape[0])):
+                print(f"\n  Sample {i+1}")
+                print(f"  passé   (8 derniers) : {y_p_np[i, -8:].round(1)}")
+                print(f"  pred_p  (8 derniers) : {pred_p[i,  -8:].round(1)}")
+                print(f"  cible   (8 premiers) : {y_np[i,    :8].round(1)}")
+                print(f"  prédit  (8 premiers) : {fc_np[i,   :8].round(1)}")
+                print(f"  cible   min/max      : {y_np[i].min():.2f} / {y_np[i].max():.2f}")
+                print(f"  prédit  min/max      : {fc_np[i].min():.2f} / {fc_np[i].max():.2f}")
+            print("─────────────────────────────────────────────────\n")
 
         all_mae.append(mae(y_np.reshape(-1), fc_np.reshape(-1)))
 
         if len(plot_samples) < n_plots_max:
-            n_take     = min(n_plots_max - len(plot_samples), x_time.shape[0])
-            indices    = torch.randperm(x_time.shape[0])[:n_take].tolist()
-            y_past_np  = y_past.cpu().numpy()
-            if scalers is not None:
-                y_past_np = scalers["Y_target"].inverse_transform(
-                    y_past_np.reshape(-1, 1)
-                ).reshape(y_past_np.shape)
-
+            n_take  = min(n_plots_max - len(plot_samples), t.shape[0])
+            indices = torch.randperm(t.shape[0])[:n_take].tolist()
             for i in indices:
                 plot_samples.append({
-                    "past":     y_past_np[i, :, 0],
-                    "target":   y_np[i, :, 0],
-                    "forecast": fc_np[i, :, 0],
+                    'past':     y_p_np[i],
+                    'pred_p':   pred_p[i],    # ← ajout
+                    'target':   y_np[i],
+                    'forecast': fc_np[i],
                 })
-
     print(f"\nMean MAE : {np.mean(all_mae):.6f}")
 
-    ctx_tag  = "ctx" if use_context else "noctx"
+    ctx_tag  = 'ctx' if use_context else 'noctx'
     out_html = ROOT / f"inference_{cfg.data.dataset_name}_h{horizon}_{ctx_tag}.html"
-    html     = build_html_report(plot_samples, all_mae, cfg, ckpt, look_back, horizon)
-    out_html.write_text(html, encoding="utf-8")
-    print(f"Rapport sauvegardé → {out_html}")
+    html     = build_html_report(plot_samples, all_mae, cfg, ckpt, ckpt_path, look_back, horizon)
+    out_html.write_text(html, encoding='utf-8')
+    print(f"Rapport → {out_html}")
 
 
 if __name__ == "__main__":
