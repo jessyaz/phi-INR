@@ -67,26 +67,31 @@ def outer_step(
             out_p = func_rep._inr_batch(coords_p, code, hs_p, x_statics, dir_idx)
 
             out_h = None
-            if coords_h is not None:
+            if coords_h is not None: # Toujours autoregressif ici
+                B         = coords_h.shape[0]
                 T_h       = coords_h.shape[1]
                 h, c      = h_final, c_final
-                last_flow = out_p[:, -1, :]
-                hs_h      = []
+                out_h     = out_p[:, -1, :]
+                hs_h      = torch.zeros(B, T_h ,h.shape[-1], device = coords_h.device)
+                flow_h    = torch.zeros(B, T_h, device = coords_h.device)
                 for t in range(T_h):
-                    h_since = torch.full((B, 1), (t + 1) / 24.0, device=coords_h.device)
-                    x_in    = torch.cat([x_context_h[:, t, :], last_flow, h_since], dim=-1)
-                    h, c    = func_rep.lstm.cell_step(x_in, h, c)
-                    hs_h.append(h.unsqueeze(1))
-                hs_h  = torch.cat(hs_h, dim=1)
-                out_h = func_rep._inr_batch(coords_h, code, hs_h, x_statics, dir_idx)
+
+                    h, c    = func_rep.lstm.cell_step( torch.cat([x_context_h[:, t, :], out_h] , dim=-1), h, c)
+
+                    out_h = func_rep._inr_batch(coords_h[:,t].unsqueeze(-1), code, h.unsqueeze(1), x_statics, dir_idx).squeeze(1)
+                    hs_h[:,t,:] = h
+                    flow_h[:,t] = out_h.squeeze(-1)
+
+               # hs_h  = torch.cat(hs_h, dim=1)
+               # out_h = func_rep._inr_batch(coords_h, code, hs_h, x_statics, dir_idx)
         else:
             out_p = func_rep._inr_batch_vanilla(coords_p, code)
-            out_h = func_rep._inr_batch_vanilla(coords_h, code) \
-                if coords_h is not None else None
+            out_h = func_rep._inr_batch_vanilla(coords_h, code) #if coords_h is not None else None
+
 
         loss_p = loss_fn(out_p, y_past)
-        loss_h = loss_fn(out_h, y_horizon) if out_h is not None \
-            else torch.tensor(0.0, device=coords_p.device)
+
+        loss_h = loss_fn(flow_h.unsqueeze(-1), y_horizon) #if out_h is not None else torch.tensor(0.0, device=coords_p.device)
         loss   = w_passed * loss_p + w_futur * loss_h
 
     return {
@@ -95,5 +100,5 @@ def outer_step(
         'loss_h': loss_h,
         'code':   code.detach(),
         'out_p':  out_p.detach(),
-        'out_h':  out_h.detach() if out_h is not None else None,
+        'out_h':  out_h.detach() #if out_h is not None else None,
     }

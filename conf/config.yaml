@@ -2,11 +2,12 @@ defaults:
   - _self_
 
 meta:
-  experiment_pack: INR_TEST
+  experiment_pack: INR_HS_REFACTO
 
 
 inference:
-  ckpt:    save_models/inr/context_scratch/delightful-cow-964_20260313_1714_best.pt
+  ckpt: save_models/inr/vanilla/sneaky-stag-351_20260313_1714_best.pt
+  #save_models/inr/INR_LSTM_FREEZE/delightful-stag-610_20260316_1057_best.pt
 
   # VANILLA - save_models/inr/vanilla/sneaky-stag-351_20260313_1714_best.pt
 
@@ -19,7 +20,7 @@ inference:
 
 paths:
   save_models:  save_models/inr
-  scalers_file: save_models/inr/scalers.pkl
+  scalers_file: save_models/inr/INR_LSTM_FREEZE/scalers.pkl
 
 data:
   train_parquet:    data/train_data.parquet
@@ -36,13 +37,14 @@ data:
 inr:
   use_context:      true    # false = INR vanilla (sans LSTM ni static)
   freeze_lstm:      false   # true = gèle poids LSTM
-  lstm_ckpt:        save_models/head_lstm/debonair-wolf-926_h256_20260316_1006_best.pt # null    # "save_models/head_lstm/run_xxx_best.pt" ou null
+  lstm_ckpt:        null # save_models/head_lstm/debonair-wolf-926_h256_20260316_1006_best.pt # null    # "save_models/head_lstm/run_xxx_best.pt" ou null
   lstm_hidden_dim:  256
-  latent_dim:       256
+  latent_dim:       256 # DIM CODE
+  hidden_dim:       256 # WIDTH INR
+  depth: 3
+
   num_frequencies:  8
   min_frequencies:  0
-  hidden_dim:       256
-  depth:            3
   base_frequency:   1.25
   include_input:    true
   static:
@@ -56,7 +58,7 @@ optim:
   lr_code:          1.0e-2
   weight_decay:     1.0e-5
   batch_size:       32
-  epochs:           200
+  epochs:           50
   scheduler:        cosine  # cosine | null
   t_max:            200
   clip_grad_value:  1.0

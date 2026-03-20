@@ -56,6 +56,8 @@ def run_epoch(inr, loader, alpha, optimizer, cfg, device, is_train=True):
             t, dir_idx, x_static, x_meteo, x_time, y, code = batch
 
             x_context = torch.cat([x_meteo, x_time], dim=-1).to(device)
+
+
             y_target  = y.to(device)
             t         = t.to(device)
             code      = code.to(device)

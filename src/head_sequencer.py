@@ -23,42 +23,20 @@ class LSTM_HEAD(nn.Module):
     def __init__(self, context_dim, hidden_dim):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.input_dim  = context_dim + 1 + 1
+        self.input_dim  = context_dim
+        print("self.LSTM.input_dim: " , self.input_dim)
 
         self.W        = nn.Parameter(torch.randn(self.input_dim + hidden_dim, hidden_dim * 4) * 0.02)
         self.b        = nn.Parameter(torch.zeros(hidden_dim * 4))
         self.out_flow = nn.Linear(hidden_dim, 1)
 
     def cell_step(self, x_t, h_t, c_t):
-        gates      = torch.cat((x_t, h_t), dim=1) @ self.W + self.b
+
+        gates      = torch.cat((x_t, h_t), dim=-1) @ self.W + self.b
         i, f, g, o = torch.split(gates, self.hidden_dim, dim=1)
         c_next     = torch.sigmoid(f) * c_t + torch.sigmoid(i) * torch.tanh(g)
         h_next     = torch.sigmoid(o) * torch.tanh(c_next)
         return h_next, c_next
-
-    def forward(self, x_dyn, y_flow, twin_idx):
-        bs, seq_len, _ = x_dyn.size()
-        h_t   = torch.zeros(bs, self.hidden_dim, device=x_dyn.device)
-        c_t   = torch.zeros(bs, self.hidden_dim, device=x_dyn.device)
-        preds = []
-
-        # ── Serie P : phase observation (teacher forcing) ──
-        for t in range(twin_idx):
-            x_in     = torch.cat([x_dyn[:, t, :], y_flow[:, t, :],
-                                  torch.zeros(bs, 1, device=x_dyn.device)], dim=-1)
-            h_t, c_t = self.cell_step(x_in, h_t, c_t)
-            preds.append(self.out_flow(h_t).unsqueeze(1))
-
-        # ── Serie H : phase horizon (auto-régressive) ──
-        last_out = preds[-1][:, 0, :]
-        for t in range(twin_idx, seq_len - 1):
-            h_since  = torch.full((bs, 1), (t - twin_idx + 1) / 24.0, device=x_dyn.device)
-            x_in     = torch.cat([x_dyn[:, t, :], last_out, h_since], dim=-1)
-            h_t, c_t = self.cell_step(x_in, h_t, c_t)
-            last_out = self.out_flow(h_t)
-            preds.append(last_out.unsqueeze(1))
-
-        return torch.cat(preds, dim=1)   # (B, T-1, 1)
 
 
     def forward_past(self, x_context, y_flow):
@@ -71,36 +49,18 @@ class LSTM_HEAD(nn.Module):
         B, T, _ = x_context.shape
         h = torch.zeros(B, self.hidden_dim, device=x_context.device)
         c = torch.zeros(B, self.hidden_dim, device=x_context.device)
-        hs = []
+        hs = torch.zeros(B, T,self.hidden_dim, device=x_context.device)
+
         for t in range(T):
             x_in = torch.cat([
                 x_context[:, t, :],
                 y_flow[:, t, :],
-                torch.zeros(B, 1, device=x_context.device),
             ], dim=-1)
             h, c = self.cell_step(x_in, h, c)
-            hs.append(h.unsqueeze(1))
-        return torch.cat(hs, dim=1), h, c
 
-    def forward_horizon(self, x_context, h_init, c_init, flow_init, inr_pred_fn):
-        """
-        Encodeur série H pour l'INR — auto-régressif.
-        Reinjecte le flow prédit par l'INR à chaque pas.
-        inr_pred_fn : callable(h_t: (B, H)) → flow (B, 1)
-        Retourne    : hs (B, T, H)
-        """
-        B, T, _ = x_context.shape
-        h, c    = h_init, c_init
-        last_flow = flow_init
-        hs = []
-        for t in range(T):
-            h_since = torch.full((B, 1), (t + 1) / 24.0, device=x_context.device)
-            x_in    = torch.cat([x_context[:, t, :], last_flow, h_since], dim=-1)
-            h, c    = self.cell_step(x_in, h, c)
-            hs.append(h.unsqueeze(1))
-            last_flow = inr_pred_fn(h)
-        return torch.cat(hs, dim=1)
+            hs[:,t,:] = h
 
+        return hs, h, c
 
 
 def warmup_cosine(warmup_epochs, total_epochs):
@@ -141,6 +101,7 @@ def run_epoch(model, loader, criterion, twin_idx, optimizer=None):
         pbar = tqdm(loader, leave=False, desc="train" if training else "val ")
         for batch in pbar:
             t_pts, _, _, x_meteo, x_time, y, _ = batch
+
             x_dyn = torch.cat([x_meteo, x_time], dim=-1).to(DEVICE)
             y     = y.to(DEVICE)
 

@@ -20,6 +20,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+from sympy.codegen.ast import none
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -27,31 +29,38 @@ ROOT = Path(__file__).resolve().parent
 
 def make_experiments(lstm_ckpt: str | None) -> list[dict]:
     base = dict(
-        epochs     = 1000,
+        epochs     = 200,
         batch_size = 32,
         lr_inr     = 1e-4,
-        lr_code    = 1e-2,
+        lr_code    = 1e-3,
     )
 
     exps = [
         {
             **base,
-            'name':        'INR_LSTM_FREEZE',
-            'use_context': True,
-            'lstm_ckpt':   lstm_ckpt,
+            'name':        'INR_FURY_RESEARCH',
+            'use_context': False,
+            'lstm_ckpt':   None,
             'freeze_lstm': False,
-            'description': 'Contexte LSTM chargé — poids libres',
-        },
-        {
-            **base,
-            'name':        'INR_LSTM_FREEZE',
-            'use_context': True,
-            'lstm_ckpt':   lstm_ckpt,
-            'freeze_lstm': True,
-            'description': 'Contexte LSTM chargé — poids gelés',
-        },
+            'latent_dim' :  i,
+            'hidden_dim' :  j,  # Width
+            'depth' :  k,
+            'description': 'Recherche impact CODE WIDTH DEPTH',
+        }
+        for i in [128, 256, 512, 1024]
+        for j in [128, 256, 512, 1024]
+        for k in [2, 3, 4, 5]
     ]
 
+
+    #{
+   #     **base,
+   #     'name':        'INR_CODE_RESEARCH',
+   #     'use_context': False,
+   #     #'lstm_ckpt':   lstm_ckpt,
+   #     'freeze_lstm': False,
+   #     'description': 'Contexte LSTM chargé — poids libres',
+   # },
     return exps
 
 
@@ -67,6 +76,11 @@ def run_experiment(exp: dict) -> dict:
         f"meta.experiment_pack={name}",
         f"paths.save_models=save_models/inr/{name}",
         f"paths.scalers_file=save_models/inr/{name}/scalers.pkl",
+
+        f"inr.latent_dim={exp['latent_dim']}",
+        f"inr.hidden_dim={exp['hidden_dim']}",
+        f"inr.depth={exp['depth']}",
+
         f"inr.use_context={str(exp['use_context']).lower()}",
         f"inr.freeze_lstm={str(exp['freeze_lstm']).lower()}",
         f"inr.lstm_ckpt={'null' if exp['lstm_ckpt'] is None else exp['lstm_ckpt']}",

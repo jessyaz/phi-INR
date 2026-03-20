@@ -22,6 +22,7 @@ from src.network import ModulatedFourierFeatures
 
 # ── Helpers ──────────────────────────────────────────────────
 
+
 def load_checkpoint(cfg) -> tuple[dict, Path]:
     """Charge le checkpoint spécifié ou le dernier sauvegardé."""
     save_dir = ROOT / cfg.paths.save_models

@@ -15,7 +15,7 @@ WEIGHT_TARGET = 0
 
 X_TIME_DIM  = 3   # dow_sin, dow_cos, is_holiday
 METEO_DIM   = len(COL_METEO)
-LSTM_IN_DIM = METEO_DIM + X_TIME_DIM
+LSTM_IN_DIM = METEO_DIM + X_TIME_DIM + 1 #+FLOW(1)
 STAT_DIM    = len(COL_STATIC)
 
 # ── Scaler ───────────────────────────────────────────────────

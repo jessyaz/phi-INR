@@ -8,7 +8,7 @@ head_lstm:
     batch_size:    32
 
   model:
-    context_dim:   12      # LSTM_IN_DIM = meteo(9) + x_time(3)
+    context_dim:   13      # LSTM_IN_DIM = meteo(9) + x_time(3) + FLOW(1) XC+XS+AR
     hidden_dim:    256
     lr:            1.0e-3
     epochs:        50
