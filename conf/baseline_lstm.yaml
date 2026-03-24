@@ -1,0 +1,29 @@
+# conf/baseline_lstm.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Lancez avec :
+#   python src/baseline_lstm.py                              # mode 'none' (défaut)
+#   python src/baseline_lstm.py model.static_mode=init
+#   python src/baseline_lstm.py model.static_mode=concat
+# ─────────────────────────────────────────────────────────────────────────────
+
+baseline_lstm:
+
+  data:
+    train_parquet: data/train_data.parquet
+    val_parquet:   data/val_data.parquet
+    batch_size:    32
+
+  model:
+    hidden_dim:     128
+    lr:             1e-3
+    warmup_epochs:  5
+    epochs:         100
+    twin_idx:       120      # même valeur que head_lstm — séparation obs/horizon
+    mode:    concat
+
+    spatial_dim:    32
+    dir_dim:        8
+    num_directions: 7        # augmenter si direction max >= 6
+
+  mlflow:
+    experiment_name: baseline_lstm

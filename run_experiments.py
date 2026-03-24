@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parent
 
 def make_experiments(lstm_ckpt: str | None) -> list[dict]:
     base = dict(
-        epochs     = 200,
+        epochs     = 300,
         batch_size = 32,
         lr_inr     = 1e-4,
         lr_code    = 1e-3,
@@ -38,18 +38,41 @@ def make_experiments(lstm_ckpt: str | None) -> list[dict]:
     exps = [
         {
             **base,
-            'name':        'INR_FURY_RESEARCH',
-            'use_context': False,
-            'lstm_ckpt':   None,
+            'name':        'INR_STATIC',
+            'use_context': True,
+            'control': "static_only",
+            'lstm_ckpt':   None, #"save_models/head_lstm/debonair-wolf-926_h256_20260316_1006_best.pt",
             'freeze_lstm': False,
-            'latent_dim' :  i,
-            'hidden_dim' :  j,  # Width
-            'depth' :  k,
-            'description': 'Recherche impact CODE WIDTH DEPTH',
+            'latent_dim' :  512,
+            'hidden_dim' :  128,  # Width
+            'depth' :  4,
+            'description': 'Recherche INR W STATIC',
+        },
+        {
+            **base,
+            'name':        'INR_STATIC',
+            'use_context': True,
+            'control': None,
+            'lstm_ckpt':   None, #"save_models/head_lstm/debonair-wolf-926_h256_20260316_1006_best.pt",
+            'freeze_lstm': False,
+            'latent_dim' :  512,
+            'hidden_dim' :  128,  # Width
+            'depth' :  4,
+            'description': 'Recherche INR W STATIC',
+        },
+        {
+            **base,
+            'name':        'INR_STATIC',
+            'use_context': False,
+            'control': None,
+            'lstm_ckpt':  None,
+            'freeze_lstm': None,
+            'latent_dim' :  512,
+            'hidden_dim' :  128,  # Width
+            'depth' :  4,
+            'description': 'Recherche INR W STATIC',
         }
-        for i in [128, 256, 512, 1024]
-        for j in [128, 256, 512, 1024]
-        for k in [2, 3, 4, 5]
+
     ]
 
 
@@ -81,8 +104,11 @@ def run_experiment(exp: dict) -> dict:
         f"inr.hidden_dim={exp['hidden_dim']}",
         f"inr.depth={exp['depth']}",
 
+
+        f"inr.control= {str(exp['control'])}",
         f"inr.use_context={str(exp['use_context']).lower()}",
         f"inr.freeze_lstm={str(exp['freeze_lstm']).lower()}",
+
         f"inr.lstm_ckpt={'null' if exp['lstm_ckpt'] is None else exp['lstm_ckpt']}",
         f"optim.epochs={exp['epochs']}",
         f"optim.batch_size={exp['batch_size']}",

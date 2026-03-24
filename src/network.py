@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from src.film_conditionning import film_translate
+from src.film_conditionning import film_translate, film_translate_spe
 from src.head_sequencer import LSTM_HEAD
 from src.dataloaders import LSTM_IN_DIM, STAT_DIM
 
@@ -26,7 +26,7 @@ class FourierSpatialEncoder(nn.Module):
 
 # ── Encodeur statique complet ─────────────────────────────────
 
-class StaticEncoder(nn.Module):
+class StaticEncoder_LAST(nn.Module):
     """
     lat/lon → FourierSpatialEncoder → (B, spatial_dim)
     dir_idx → nn.Embedding          → (B, dir_dim)
@@ -37,6 +37,7 @@ class StaticEncoder(nn.Module):
         self.spatial_enc   = FourierSpatialEncoder(num_freqs=16, d_out=spatial_dim, sigma=sigma)
         self.dir_embedding = nn.Embedding(num_embeddings=num_directions, embedding_dim=dir_dim)
         self.out_dim       = spatial_dim + dir_dim
+     #   self.norm          = nn.LayerNorm(self.out_dim)
 
     def forward(self, x_statics, dir_idx):
         assert dir_idx.max() < self.dir_embedding.num_embeddings, (
@@ -45,19 +46,97 @@ class StaticEncoder(nn.Module):
         )
         spatial = self.spatial_enc(x_statics.float())
         dir_vec = self.dir_embedding(dir_idx)
-        return torch.cat([spatial, dir_vec], dim=-1)
+        return torch.cat([spatial, dir_vec], dim=-1)#self.norm( torch.cat([spatial, dir_vec], dim=-1) )
 
+class StaticEncoder(nn.Module):
+    """
+    lat/lon → MLP  → (B, spatial_dim)
+    dir_idx → Embedding → (B, dir_dim)
+    concat  → (B, spatial_dim + dir_dim)
+    """
+    def __init__(self, spatial_dim=32, dir_dim=8, num_directions=6, **kwargs):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(2, 64),
+            nn.GELU(),
+            nn.Linear(64, spatial_dim),
+        )
+        self.dir_embedding = nn.Embedding(num_embeddings=num_directions, embedding_dim=dir_dim)
+        self.out_dim       = spatial_dim + dir_dim
+
+    def forward(self, x_statics, dir_idx):
+        assert dir_idx.max() < self.dir_embedding.num_embeddings, (
+            f"dir_idx max={dir_idx.max().item()} >= num_directions={self.dir_embedding.num_embeddings}"
+        )
+        spatial = self.mlp(x_statics.float())
+        dir_vec = self.dir_embedding(dir_idx)
+        return torch.cat([spatial, dir_vec], dim=-1)
 
 # ── Hypernetwork avec contexte ────────────────────────────────
 
 class LatentToModulation(nn.Module):
     """code + h_dynamics + static_emb → modulations FiLM"""
-    def __init__(self, latent_dim, lstm_hidden_dim, static_emb_dim, num_modulations):
+    def __init__(self, latent_dim, lstm_hidden_dim, static_emb_dim, num_modulations, control = None):
         super().__init__()
-        self.net = nn.Linear(latent_dim + lstm_hidden_dim + static_emb_dim, num_modulations)
+
+        self.control = control
+
+
+        if control == "static_only":
+            print("HN Mode S : ", control)
+
+            input_dim = latent_dim + static_emb_dim
+            hidden_dim = input_dim * 2
+
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, num_modulations)
+            )
+        else:
+
+            input_dim = latent_dim + static_emb_dim + lstm_hidden_dim
+            hidden_dim = input_dim * 2
+
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, num_modulations)
+            )
+
+            print("HN Mode : ", control)
 
     def forward(self, code, h_t, static_emb):
-        return self.net(torch.cat([code, h_t, static_emb], dim=-1))
+        if self.control == "static_only":
+            return self.net(torch.cat([code, static_emb], dim=-1))
+        else:
+            return self.net(torch.cat([code, h_t, static_emb], dim=-1))
+
+
+class LatentToModulationCode(nn.Module):
+    """code + h_dynamics + static_emb → modulations FiLM"""
+    def __init__(self, latent_dim, static_emb_dim, num_modulations, control = None):
+        super().__init__()
+
+        self.control = control
+
+        print("HN Mode SUPER : ", control)
+
+        input_dim = latent_dim + static_emb_dim
+        hidden_dim = input_dim * 2
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, num_modulations),
+        )
 
 
 # ── Hypernetwork vanilla ──────────────────────────────────────
@@ -120,6 +199,7 @@ class ModulatedFourierFeatures(nn.Module):
             is_training      = True,
             use_context      = True,
             freeze_lstm      = False,
+            control          = None,
     ):
         super().__init__()
         self.is_training     = is_training
@@ -150,15 +230,18 @@ class ModulatedFourierFeatures(nn.Module):
 
         self.num_modulations = num_modulations
 
-        # ── LSTM encodeur de contexte ──
-        self.lstm = LSTM_HEAD(
-            context_dim = LSTM_IN_DIM,
-            hidden_dim  = lstm_hidden_dim,
-        )
-        if freeze_lstm:
-            for p in self.lstm.parameters():
-                p.requires_grad_(False)
-            print("[MFF] Poids LSTM gelés")
+        self.control = control
+
+        if self.control != "static_only":
+            # ── LSTM encodeur de contexte ──
+            self.lstm = LSTM_HEAD(
+                context_dim = LSTM_IN_DIM,
+                hidden_dim  = lstm_hidden_dim,
+            )
+            if freeze_lstm:
+                for p in self.lstm.parameters():
+                    p.requires_grad_(False)
+                print("[MFF] Poids LSTM gelés")
 
         # ── Encodeur statique ──
         self.static_encoder = StaticEncoder(
@@ -175,9 +258,16 @@ class ModulatedFourierFeatures(nn.Module):
             lstm_hidden_dim = lstm_hidden_dim,
             static_emb_dim  = static_emb_dim,
             num_modulations = num_modulations,
+            control = control,
         )
         self.latent_to_mod_vanilla = LatentToModulationVanilla(
             latent_dim      = latent_dim,
+            num_modulations = num_modulations,
+        )
+
+        self.latent_to_mod_code = LatentToModulationCode(
+            latent_dim      = latent_dim,
+            static_emb_dim  = static_emb_dim,
             num_modulations = num_modulations,
         )
 
@@ -193,27 +283,10 @@ class ModulatedFourierFeatures(nn.Module):
         print(f"[MFF] Mode : {'context LSTM' if use_context else 'INR vanilla'}")
 
     def _inr_batch(self, coords, code, hs, x_statics, dir_idx):
-        """
-        Passe vectorisée sur T pas simultanément.
-        coords    : (B, T, 1)
-        code      : (B, latent_dim)
-        hs        : (B, T, lstm_hidden_dim) FAUX
-        x_statics : (B, STAT_DIM)
-        dir_idx   : (B,)
-        """
         B, T, _ = coords.shape
-
         static_emb = self.static_encoder(x_statics, dir_idx)          # (B, S)
-        #static_emb = static_emb.unsqueeze(1).expand(-1, T, -1)        # (B, T, S)
-        # Code (B,latent)
-        #code_exp   = code.unsqueeze(1).expand(-1, T, -1)              # (B, T, latent)
-
         position   = self.embedding(coords)                            # (B, T, pos_dim)
-
-
         out = torch.zeros(B, T, 1, device = coords.device)
-
-
 
         for t in range(T):
 
@@ -227,21 +300,62 @@ class ModulatedFourierFeatures(nn.Module):
 
             out[:,t] = post_out
 
+        return out
 
-            # position_flat = position.reshape(B * T, 1, -1)                # (B*T, 1, pos_dim)
-       # pre_out = film_translate(position_flat, mods, self.layers[:-1], torch.relu)
-    #    out     = self.layers[-1](pre_out)                             # (B*T, 1, 1)
+
+    def _inr_batch_static_only(self, coords, code, x_statics, dir_idx, special=None):
+        B, T, _ = coords.shape
+        static_emb = self.static_encoder(x_statics, dir_idx)          # (B, S)
+        position   = self.embedding(coords)                            # (B, T, pos_dim)
+        out = torch.zeros(B, T, 1, device = coords.device)
+
+        if special == True:
+            for t in range(T):
+
+                mods_code = self.latent_to_mod_vanilla(
+                    code
+                )
+                mods_statique =  self.latent_to_mod_code(
+                    static_emb
+                )
+
+                pre_out = film_translate_spe(position[:,t].squeeze(-1), mods_code,mods_statique, self.layers[:-1], torch.relu)
+                post_out     = self.layers[-1](pre_out)
+
+                out[:,t] = post_out
+
+            return out
+
+
+        for t in range(T):
+
+            mods = self.latent_to_mod(
+                code,
+                [None],
+                static_emb,
+            )
+            pre_out = film_translate(position[:,t].squeeze(-1), mods, self.layers[:-1], torch.relu)
+            post_out     = self.layers[-1](pre_out)
+
+            out[:,t] = post_out
 
         return out
 
     def _inr_batch_vanilla(self, coords, code):
-        """INR vanilla vectorisé — sans contexte."""
+
         B, T, _ = coords.shape
-        code_exp      = code.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)
-        position_flat = self.embedding(coords).reshape(B * T, 1, -1)
-        mods          = self.latent_to_mod_vanilla(code_exp)
-        pre_out       = film_translate(position_flat, mods, self.layers[:-1], torch.relu)
-        return self.layers[-1](pre_out).reshape(B, T, 1)
+        position = self.embedding(coords)
+
+        out = torch.zeros(B, T, 1, device = coords.device)
+
+        for t in range(T):
+
+            mods          = self.latent_to_mod_vanilla(code)
+            pre_out = film_translate(position[:,t].squeeze(-1), mods, self.layers[:-1], torch.relu)
+            out[:,t] = self.layers[-1](pre_out)
+
+        return out
+
 
     def modulated_forward(self, coords_p, code, x_context_p, y_past,
                           x_statics=None, dir_idx=None,

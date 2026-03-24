@@ -20,19 +20,29 @@ def film_translate(position, mods, layers, activation):
 
     return h
 
-def film_translate2(position, features, layers, activation):
 
-    feature_shape = features.shape[0]
-    feature_dim = features.shape[-1]
+def film_translate_spe(position, mods_code, mods_static, layers, activation):
+
+    B = mods_code.shape[0]
     num_hidden = len(layers)
 
-    features = features.reshape(feature_shape, 1, num_hidden, feature_dim // num_hidden)
+    dim = mods_code.shape[-1] // num_hidden
+    mods_code = mods_code.view(B, num_hidden, dim)
+
+    mods_static = mods_static.view(B, num_hidden, dim)
 
     h = position
 
     for i, l in enumerate(layers):
-        # CHECK SHAPE
-        h = activation(l(h) + features[..., i, :])
 
+        beta  = mods_code[:, i, :]      # additif (code)
+        gamma = mods_static[:, i, :]    # multiplicatif (static)
+
+        h = l(h)
+
+
+        h = (1 + gamma) * h + beta
+
+        h = activation(h)
 
     return h

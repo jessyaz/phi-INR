@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 meta:
-  experiment_pack: INR_HS_REFACTO
+  experiment_pack: INR4RE
 
 
 inference:
@@ -19,7 +19,7 @@ inference:
 
 
 paths:
-  save_models:  save_models/inr
+  save_models:  save_models/inr2/
   scalers_file: save_models/inr/INR_LSTM_FREEZE/scalers.pkl
 
 data:
@@ -35,21 +35,22 @@ data:
   pin_memory:       true
 
 inr:
-  use_context:      true    # false = INR vanilla (sans LSTM ni static)
+  control:          "vanilla" #"static_only"
+  use_context:      false    # false = INR vanilla (sans LSTM ni static)
   freeze_lstm:      false   # true = gèle poids LSTM
-  lstm_ckpt:        null # save_models/head_lstm/debonair-wolf-926_h256_20260316_1006_best.pt # null    # "save_models/head_lstm/run_xxx_best.pt" ou null
+  lstm_ckpt:        null #save_models/head_lstm/debonair-wolf-926_h256_20260316_1006_best.pt # null    # "save_models/head_lstm/run_xxx_best.pt" ou null
   lstm_hidden_dim:  256
-  latent_dim:       256 # DIM CODE
-  hidden_dim:       256 # WIDTH INR
-  depth: 3
+  latent_dim:       128 # DIM CODE #512
+  hidden_dim:       128 # WIDTH INR
+  depth: 4
 
   num_frequencies:  8
   min_frequencies:  0
   base_frequency:   1.25
   include_input:    true
   static:
-    spatial_dim:    128      # sortie FourierSpatialEncoder
-    dir_dim:        8       # sortie nn.Embedding direction
+    spatial_dim:    64      # sortie FourierSpatialEncoder
+    dir_dim:        8 #8       # sortie nn.Embedding direction
     num_directions: 7       # nb directions distinctes
     sigma:          0.1     # échelle Fourier (0.1 = sensible grandes distances)
 
@@ -58,9 +59,9 @@ optim:
   lr_code:          1.0e-2
   weight_decay:     1.0e-5
   batch_size:       32
-  epochs:           50
-  scheduler:        cosine  # cosine | null
-  t_max:            200
+  epochs:           100
+  scheduler:        null  # cosine | null
+  t_max:            100
   clip_grad_value:  1.0
 
 inner:

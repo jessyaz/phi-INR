@@ -26,7 +26,7 @@ class LSTM_HEAD(nn.Module):
         self.input_dim  = context_dim
         print("self.LSTM.input_dim: " , self.input_dim)
 
-        self.W        = nn.Parameter(torch.randn(self.input_dim + hidden_dim, hidden_dim * 4) * 0.02)
+        self.W        = nn.Parameter(torch.randn(self.input_dim + 1 + hidden_dim, hidden_dim * 4) * 0.02)
         self.b        = nn.Parameter(torch.zeros(hidden_dim * 4))
         self.out_flow = nn.Linear(hidden_dim, 1)
 

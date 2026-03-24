@@ -1,0 +1,49 @@
+# conf/data_schema.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Schéma des données — source de vérité unique.
+# Chargé par dataloaders.py, sauvegardé dans chaque snapshot.
+# Toute modification ici invalide les checkpoints antérieurs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+data_schema:
+
+  # ── Colonnes météo (features dynamiques) ──────────────────────────────────
+  col_meteo:
+    - msl    # Mean sea level pressure
+    - tcc    # Total cloud cover
+    - u10    # U-component wind 10m
+    - v10    # V-component wind 10m
+    - t2m    # Temperature 2m
+    - d2m    # Dew point 2m
+    - tp     # Total precipitation
+    - cp     # Convective precipitation
+    - ssrd   # Surface solar radiation downwards
+
+  # ── Colonnes statiques (lat/lon du site) ──────────────────────────────────
+  col_static:
+    - LAT
+    - LON
+
+  # ── Colonne cible ─────────────────────────────────────────────────────────
+  col_target:    FLOW
+  weight_target: 0
+
+  # ── Features temporelles ──────────────────────────────────────────────────
+  # Chaque entrée = une colonne produite dans arr_time.
+  # Modifier cette liste change x_time_dim et invalide les checkpoints.
+  time_features:
+    - dow              # day of week brut (0-6)
+    # - dow_sin        # sin(2π·dow/7)  — décommenter pour encodage cyclique
+    # - dow_cos        # cos(2π·dow/7)
+    # - is_holiday     # booléen jour férié (colonne IS_HOLIDAY requise)
+
+  # ── Encodage cyclique du jour de la semaine ────────────────────────────────
+  # false → dow brut (x_time_dim = 1)
+  # true  → sin+cos  (x_time_dim = 2, invalide les checkpoints dow=brut)
+  use_cyclic_dow: false
+
+  # ── Dimensions dérivées (auto-calculées dans dataloaders.py) ──────────────
+  # meteo_dim   = len(col_meteo)          = 9
+  # x_time_dim  = len(time_features)      = 1   (ou 2 si use_cyclic_dow)
+  # lstm_in_dim = meteo_dim + x_time_dim  = 10
+  # stat_dim    = len(col_static)         = 2
