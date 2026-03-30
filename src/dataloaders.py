@@ -62,7 +62,7 @@ def _compute_x_time_dim() -> int:
     return dim
 
 X_TIME_DIM  : int = _compute_x_time_dim()
-LSTM_IN_DIM : int = METEO_DIM + X_TIME_DIM
+LSTM_IN_DIM : int = METEO_DIM
 
 print(
     f"[DataSchema] meteo={METEO_DIM}  x_time={X_TIME_DIM}  "
@@ -146,6 +146,7 @@ def _build_time_features(serie: pd.DataFrame) -> np.ndarray:
                 cols.append(np.cos(angle).astype("float32"))
             else:
                 cols.append(serie["DATETIME"].dt.dayofweek.values.astype("float32"))
+
         elif feat == "is_holiday":
 
             cols.append(serie["IS_HOLIDAY"].values.astype("float32"))
@@ -168,6 +169,7 @@ class NZDataset(Dataset):
             window:     str = "10D",
             scalers         = None,
             latent_dim: int = 128,
+            skip_site_filter = False
     ):
         self.mode       = mode
         self.latent_dim = latent_dim
@@ -178,7 +180,13 @@ class NZDataset(Dataset):
 
         df = pd.read_parquet(parquet_file)
         df["DATETIME"] = pd.to_datetime(df["DATETIME"])
-        df = df[df["SITEREF"].isin(allowed_sites)]
+
+        if not skip_site_filter:
+            print("Skipping filter")
+            df = df[df["SITEREF"].isin(allowed_sites)]
+        else:
+            print("apply filter")
+
         df = df.sort_values(["SITEREF", "DIRECTION", "DATETIME"]).reset_index(drop=True)
 
         # ── Scalers ──
@@ -214,9 +222,7 @@ class NZDataset(Dataset):
                 df.groupby(["SITEREF", "DIRECTION"]),
                 desc=f"[{mode}] Séries",
         ):
-            #group = self.scalers["static"].transform(
-            #    group[COL_STATIC].iloc[[0]].values
-            #).squeeze(0).astype("float32")
+
 
             serie = group[group["WEIGHT"] == WEIGHT_TARGET].sort_values("DATETIME")
             if serie.empty:
@@ -233,7 +239,7 @@ class NZDataset(Dataset):
             arr_meteo = serie[COL_METEO].values.astype("float32")
 
             arr_static = self.scalers["static"].transform(
-                serie[COL_STATIC].iloc[[0]].values
+                serie[COL_STATIC].iloc[[0]].values # Uniquement lon et lat
             ).astype("float32").squeeze(0)
 
             arr_time  = _build_time_features(serie)        # (N, X_TIME_DIM)

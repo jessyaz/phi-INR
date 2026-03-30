@@ -21,8 +21,8 @@ data_schema:
 
   # ── Colonnes statiques (lat/lon du site) ──────────────────────────────────
   col_static:
-    - LAT
-    - LON
+    - ELAT
+    - ELON
 
   # ── Colonne cible ─────────────────────────────────────────────────────────
   col_target:    FLOW
@@ -35,7 +35,7 @@ data_schema:
     - dow              # day of week brut (0-6)
     # - dow_sin        # sin(2π·dow/7)  — décommenter pour encodage cyclique
     # - dow_cos        # cos(2π·dow/7)
-    # - is_holiday     # booléen jour férié (colonne IS_HOLIDAY requise)
+    - is_holiday     # booléen jour férié (colonne IS_HOLIDAY requise)
 
   # ── Encodage cyclique du jour de la semaine ────────────────────────────────
   # false → dow brut (x_time_dim = 1)

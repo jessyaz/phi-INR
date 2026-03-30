@@ -24,10 +24,11 @@ class LSTM_HEAD(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.input_dim  = context_dim
-        print("self.LSTM.input_dim: " , self.input_dim)
+        print("self.LSTM.input_dim: " , self.input_dim, self.hidden_dim)
 
         self.W        = nn.Parameter(torch.randn(self.input_dim + 1 + hidden_dim, hidden_dim * 4) * 0.02)
-        self.b        = nn.Parameter(torch.zeros(hidden_dim * 4))
+
+        self.b        = nn.Parameter(torch.zeros(self.hidden_dim * 4))
         self.out_flow = nn.Linear(hidden_dim, 1)
 
     def cell_step(self, x_t, h_t, c_t):
@@ -56,6 +57,8 @@ class LSTM_HEAD(nn.Module):
                 x_context[:, t, :],
                 y_flow[:, t, :],
             ], dim=-1)
+
+
             h, c = self.cell_step(x_in, h, c)
 
             hs[:,t,:] = h

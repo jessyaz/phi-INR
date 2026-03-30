@@ -2,7 +2,7 @@ defaults:
   - _self_
 
 meta:
-  experiment_pack: INR4RE
+  experiment_pack: AugC-INR2
 
 
 inference:
@@ -27,7 +27,7 @@ data:
   val_parquet:      data/val_data.parquet
   test_parquet:     data/test_data.parquet
   dataset_name:     nz
-  input_dim:        1       # dimension coords temporelles
+  input_dim:        1      # dimension coords temporelles ?
   output_dim:       1       # flow
   look_back_window: 192     # heures observation (serie_p)
   horizon:          48     # heures prédiction  (serie_h)
@@ -35,21 +35,21 @@ data:
   pin_memory:       true
 
 inr:
-  control:          "vanilla" #"static_only"
-  use_context:      false    # false = INR vanilla (sans LSTM ni static)
+  control:          "dynamic" #"static_only"
+  use_context:      true    # false = INR vanilla (sans LSTM ni static)
   freeze_lstm:      false   # true = gèle poids LSTM
   lstm_ckpt:        null #save_models/head_lstm/debonair-wolf-926_h256_20260316_1006_best.pt # null    # "save_models/head_lstm/run_xxx_best.pt" ou null
   lstm_hidden_dim:  256
-  latent_dim:       128 # DIM CODE #512
+  latent_dim:       256 # DIM CODE #512
   hidden_dim:       128 # WIDTH INR
   depth: 4
 
   num_frequencies:  8
   min_frequencies:  0
   base_frequency:   1.25
-  include_input:    true
+  include_input:    false
   static:
-    spatial_dim:    64      # sortie FourierSpatialEncoder
+    spatial_dim:    128      # sortie FourierSpatialEncoder
     dir_dim:        8 #8       # sortie nn.Embedding direction
     num_directions: 7       # nb directions distinctes
     sigma:          0.1     # échelle Fourier (0.1 = sensible grandes distances)
@@ -60,8 +60,8 @@ optim:
   weight_decay:     1.0e-5
   batch_size:       32
   epochs:           100
-  scheduler:        null  # cosine | null
-  t_max:            100
+  scheduler:        cosine  # cosine | null
+  t_max:            200
   clip_grad_value:  1.0
 
 inner:

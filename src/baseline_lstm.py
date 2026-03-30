@@ -1,23 +1,13 @@
 """
 baseline_lstm.py
 ────────────────────────────────────────────────────────────────────────────────
-Baseline LSTM — 3 modes d'entrée, AR à partir de twin_idx.
+Baseline LSTM — trois modes :
+  flow_only   : entrée = [y_flow]                        (dim = 1)
+  static_only : entrée = [y_flow, static_emb]            (dim = 1 + STATIC_SEQ_DIM)
+  dynamic     : entrée = [y_flow, static_emb, x_dyn]     (dim = 1 + STATIC_SEQ_DIM + x_dyn_dim)
 
-Modes (model.mode) :
-  dynamic_static  →  [x_meteo, x_time, y_flow, static_emb]   à chaque pas
-  static_only     →  [y_flow, static_emb]                     à chaque pas
-  flow_only       →  [y_flow]                                 à chaque pas
-
-Phase P  (t = 0 .. twin_idx-2) : teacher-forcing sur y observé
-Phase H  (t = twin_idx-1 .. T-2) : AR — le flow prédit alimente le pas suivant
-                                    dynamic_static utilise x_meteo/x_time futurs
-
-Sortie : preds (B, T-1, 1) — compatible avec compute_losses() de head_sequencer.py
-
-Usage :
-  python baseline_lstm.py baseline_lstm.model.mode=dynamic_static
-  python baseline_lstm.py baseline_lstm.model.mode=static_only
-  python baseline_lstm.py baseline_lstm.model.mode=flow_only
+Phase P (t = 0 .. twin_idx-2)   : teacher-forcing sur y observé
+Phase H (t = twin_idx-1 .. T-2) : autorégressif
 """
 
 from __future__ import annotations
@@ -39,146 +29,129 @@ from datetime import datetime
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 
-from src.dataloaders import NZDataset, METEO_DIM, X_TIME_DIM
-from src.network import StaticEncoder
+from src.dataloaders import NZDataset, STAT_DIM, X_TIME_DIM
 
-DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-FLOW_DIM = 1
+DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+FLOW_DIM       = 1
+STATIC_SEQ_DIM = STAT_DIM + X_TIME_DIM + 8   # x_static + x_time + dir embedding
+
+
+# ── Direction embedding ───────────────────────────────────────────────────────
+
+class DirEmbedding(nn.Module):
+    def __init__(self, output_dim: int = 8):
+        super().__init__()
+        self.embed = nn.Linear(1, output_dim)
+
+    def forward(self, x):          # x : (B,)  → (B, output_dim)
+        return self.embed(x.float().unsqueeze(-1))
 
 
 # ── Baseline LSTM ─────────────────────────────────────────────────────────────
 
 class BaselineLSTM(nn.Module):
-    """
-    Dimensions LSTM selon le mode :
-      dynamic_static : METEO_DIM + X_TIME_DIM + FLOW_DIM + static_emb_dim
-      static_only    : FLOW_DIM + static_emb_dim
-      flow_only      : FLOW_DIM
-    """
 
-    VALID_MODES = ("dynamic_static", "static_only", "flow_only")
+    VALID_MODES = ("flow_only", "static_only", "dynamic")
 
     def __init__(
             self,
-            hidden_dim:     int   = 128,
-            mode:           str   = "dynamic_static",
-            spatial_dim:    int   = 32,
-            dir_dim:        int   = 8,
-            num_directions: int   = 6,
-            sigma:          float = 0.1,
+            hidden_dim: int = 128,
+            mode:       str = "static_only",
+            x_dyn_dim:  int = 0,
     ):
         super().__init__()
-        assert mode in self.VALID_MODES, (
-            f"mode doit être parmi {self.VALID_MODES}, reçu : {mode!r}"
-        )
+        assert mode in self.VALID_MODES, f"mode must be one of {self.VALID_MODES}"
+        self.mode      = mode
         self.hidden_dim = hidden_dim
-        self.mode       = mode
 
-        # ── Encodeur statique ─────────────────────────────────────────────────
-        if mode in ("dynamic_static", "static_only"):
-            self.static_encoder = StaticEncoder(
-                spatial_dim    = spatial_dim,
-                dir_dim        = dir_dim,
-                num_directions = num_directions,
-                sigma          = sigma,
-            )
-            static_emb_dim = spatial_dim + dir_dim
-        else:
-            static_emb_dim = 0
+        # Encodeur statique (utilisé seulement si mode != flow_only)
+        self.static_encoder = nn.Sequential(
+            nn.Linear(STATIC_SEQ_DIM, STATIC_SEQ_DIM),
+            nn.ReLU(),
+            nn.Linear(STATIC_SEQ_DIM, STATIC_SEQ_DIM),
+        )
 
-        self.static_emb_dim = static_emb_dim
-
-        # ── Dimension d'entrée ────────────────────────────────────────────────
-        if mode == "dynamic_static":
-            lstm_input_dim = METEO_DIM + X_TIME_DIM + FLOW_DIM + static_emb_dim
-        elif mode == "static_only":
-            lstm_input_dim = FLOW_DIM + static_emb_dim
-        else:
+        # Calcul de la dimension d'entrée du LSTM selon le mode
+        if mode == "flow_only":
             lstm_input_dim = FLOW_DIM
+        elif mode == "static_only":
+            lstm_input_dim = FLOW_DIM + STATIC_SEQ_DIM
+        else:  # dynamic
+            lstm_input_dim = FLOW_DIM + STATIC_SEQ_DIM + x_dyn_dim
 
-        self.lstm_input_dim = lstm_input_dim
-        self.lstm           = nn.LSTM(lstm_input_dim, hidden_dim, batch_first=True)
-        self.out_proj       = nn.Linear(hidden_dim, 1)
+        self.lstm     = nn.LSTM(lstm_input_dim, hidden_dim, batch_first=True)
+        self.out_proj = nn.Linear(hidden_dim, 1)
 
         print(
             f"[BaselineLSTM] mode={mode!r} | "
+            f"STAT_DIM={STAT_DIM} X_TIME_DIM={X_TIME_DIM} "
+            f"STATIC_SEQ_DIM={STATIC_SEQ_DIM} x_dyn_dim={x_dyn_dim} | "
             f"lstm_input={lstm_input_dim} | hidden={hidden_dim}"
         )
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── Construction de l'entrée à chaque pas ─────────────────────────────────
 
-    def _get_static_emb(self, x_statics, dir_idx):
-        """(B, static_emb_dim) ou None."""
-        if self.mode in ("dynamic_static", "static_only"):
-            assert x_statics is not None and dir_idx is not None, \
-                f"x_statics et dir_idx requis pour mode={self.mode!r}"
-            return self.static_encoder(x_statics.float(), dir_idx)
-        return None
-
-    def _build_step(self, flow_t, x_dyn_t=None, static_emb=None):
+    def _build_input(self, flow, x_statics_t=None, x_dyn_t=None):
         """
-        Construit le vecteur d'entrée pour un seul pas de temps.
-        flow_t     : (B, 1)
-        x_dyn_t    : (B, METEO_DIM+X_TIME_DIM)  — utilisé si mode=dynamic_static
-        static_emb : (B, static_emb_dim)         — utilisé si mode != flow_only
-        Retourne   : (B, 1, lstm_input_dim)
+        flow        : (B, 1)
+        x_statics_t : (B, STATIC_SEQ_DIM)  — ignoré si flow_only
+        x_dyn_t     : (B, x_dyn_dim)        — utilisé seulement si dynamic
+        Retourne    : (B, 1, lstm_input_dim)
         """
-        if self.mode == "dynamic_static":
-            x_in = torch.cat([x_dyn_t, flow_t, static_emb], dim=-1)
+        if self.mode == "flow_only":
+            x = flow
         elif self.mode == "static_only":
-            x_in = torch.cat([flow_t, static_emb], dim=-1)
-        else:
-            x_in = flow_t
-        return x_in.unsqueeze(1)   # (B, 1, D)
+            x = torch.cat([flow, self.static_encoder(x_statics_t.float())], dim=-1)
+        else:  # dynamic
+            x = torch.cat([flow, self.static_encoder(x_statics_t.float()), x_dyn_t], dim=-1)
+        return x.unsqueeze(1)   # (B, 1, D)
 
-    # ── Forward : teacher-forcing phase P, AR phase H ─────────────────────────
+    # ── Forward ───────────────────────────────────────────────────────────────
 
-    def forward(
-            self,
-            x_dyn,           # (B, T, METEO_DIM+X_TIME_DIM)
-            y_flow,          # (B, T, 1)
-            twin_idx: int,   # frontière observation / horizon
-            x_statics=None,  # (B, STAT_DIM)
-            dir_idx=None,    # (B,)
-    ):
+    def forward(self, y_flow, twin_idx, x_statics=None, x_dyn=None):
         """
-        Retourne preds (B, T-1, 1).
-          preds[:,  :twin_idx-1, :] ← phase P (teacher-forcing)
-          preds[:, twin_idx-1:,  :] ← phase H (autorégressif depuis twin_idx)
+        y_flow    : (B, T, 1)
+        x_statics : (B, T, STATIC_SEQ_DIM)  — requis si mode != flow_only
+        x_dyn     : (B, T, x_dyn_dim)        — requis si mode == dynamic
+        Retourne  : preds (B, T-1, 1)
         """
         B, T, _ = y_flow.shape
-        device   = y_flow.device
-
-        static_emb = self._get_static_emb(x_statics, dir_idx)
+        device  = y_flow.device
 
         h = torch.zeros(1, B, self.hidden_dim, device=device)
         c = torch.zeros(1, B, self.hidden_dim, device=device)
-
         preds = []
 
-        # ── Phase P : t = 0 … twin_idx-2 → prédit t+1 = 1 … twin_idx-1 ──────
+        # Phase P : teacher-forcing
         for t in range(twin_idx - 1):
-            x_in        = self._build_step(y_flow[:, t, :], x_dyn[:, t, :], static_emb)
+            x_in       = self._build_input(
+                y_flow[:, t, :],
+                x_statics[:, t, :] if x_statics is not None else None,
+                x_dyn[:, t, :]     if x_dyn     is not None else None,
+            )
             out, (h, c) = self.lstm(x_in, (h, c))
             preds.append(self.out_proj(out.squeeze(1)))   # (B, 1)
 
-        # ── Phase H : AR depuis twin_idx ─────────────────────────────────────
-        # Input flow = dernière prédiction ; x_dyn futur reste disponible
-        last_pred = preds[-1]   # (B, 1)
+        x_dyn_fix = x_dyn[:, t, :]
+        # Phase H : autorégressif
+        last_pred = preds[-1]
         for t in range(twin_idx - 1, T - 1):
-            x_in        = self._build_step(last_pred, x_dyn[:, t, :], static_emb)
+            x_in       = self._build_input(
+                last_pred,
+                x_statics[:, t, :] if x_statics is not None else None,
+                x_dyn_fix     if x_dyn     is not None else None,
+            )
+
             out, (h, c) = self.lstm(x_in, (h, c))
             last_pred   = self.out_proj(out.squeeze(1))
             preds.append(last_pred)
 
-        # (B, T-1, 1)
-        return torch.stack(preds, dim=1)#.unsqueeze(-1)
+        return torch.stack(preds, dim=1)   # (B, T-1, 1)
 
 
 # ── Pertes ────────────────────────────────────────────────────────────────────
 
 def compute_losses(preds, y, twin_idx, criterion):
-    """Compatible avec head_sequencer.compute_losses."""
     y_shifted = y[:, 1:, :]
     loss_p = criterion(preds[:, :twin_idx - 1, :], y_shifted[:, :twin_idx - 1, :])
     loss_h = criterion(preds[:, twin_idx - 1:, :], y_shifted[:, twin_idx - 1:, :])
@@ -186,7 +159,7 @@ def compute_losses(preds, y, twin_idx, criterion):
     return loss, loss_p, loss_h
 
 
-# ── Boucle d'entraînement ─────────────────────────────────────────────────────
+# ── LR schedule ───────────────────────────────────────────────────────────────
 
 def warmup_cosine(warmup_epochs, total_epochs):
     def lr_lambda(epoch):
@@ -197,27 +170,35 @@ def warmup_cosine(warmup_epochs, total_epochs):
     return lr_lambda
 
 
-def run_epoch(model, loader, criterion, twin_idx, optimizer=None):
-    training     = optimizer is not None
-    needs_static = model.mode in ("dynamic_static", "static_only")
-    model.train() if training else model.eval()
+# ── Boucle entraînement / validation ─────────────────────────────────────────
 
+def run_epoch(model, loader, criterion, twin_idx, dir_emb, optimizer=None):
+    training = optimizer is not None
+    model.train() if training else model.eval()
     total, total_p, total_h = 0.0, 0.0, 0.0
 
     with torch.set_grad_enabled(training):
         pbar = tqdm(loader, leave=False, desc="train" if training else "val ")
         for batch in pbar:
-            _, dir_idx, x_static, x_meteo, x_time, y, _ = batch
+            _, dir_idx, x_static, x_dyn, x_time, y, _ = batch
 
-            x_dyn    = torch.cat([x_meteo, x_time], dim=-1).to(DEVICE)
-            y        = y.to(DEVICE)
-            x_static = x_static.to(DEVICE)
-            dir_idx  = dir_idx.to(DEVICE)
+            y     = y.to(DEVICE)
+            x_dyn = x_dyn.to(DEVICE)
+
+            # ── x_statics séquentiel : (B, T, STATIC_SEQ_DIM) ────────────────
+            dir_vec = dir_emb(dir_idx.to(DEVICE))                          # (B, 8)
+            T       = x_time.size(1)
+            x_statics_seq = torch.cat([
+                x_static.unsqueeze(1).expand(-1, T, -1).to(DEVICE),
+                x_time.to(DEVICE),
+                dir_vec.unsqueeze(1).expand(-1, T, -1),
+            ], dim=-1)                                                       # (B, T, STATIC_SEQ_DIM)
 
             preds = model(
-                x_dyn, y, twin_idx,
-                x_statics = x_static if needs_static else None,
-                dir_idx   = dir_idx  if needs_static else None,
+                y_flow    = y,
+                twin_idx  = twin_idx,
+                x_statics = x_statics_seq if model.mode != "flow_only" else None,
+                x_dyn     = x_dyn         if model.mode == "dynamic"   else None,
             )
 
             loss, loss_p, loss_h = compute_losses(preds, y, twin_idx, criterion)
@@ -246,8 +227,8 @@ def run_epoch(model, loader, criterion, twin_idx, optimizer=None):
 @hydra.main(version_base=None, config_path="../conf", config_name="baseline_lstm")
 def main(cfg: DictConfig):
     conf = cfg.baseline_lstm
-    print(f"Device : {DEVICE}")
-    print(f"Mode   : {conf.model.mode}")
+    print(f"Device  : {DEVICE}")
+    print(f"Mode    : {conf.model.mode}")
 
     trainset = NZDataset(ROOT / conf.data.train_parquet, mode="train")
     valset   = NZDataset(ROOT / conf.data.val_parquet,   mode="val", scalers=trainset.scalers)
@@ -255,17 +236,25 @@ def main(cfg: DictConfig):
     train_loader = DataLoader(trainset, batch_size=conf.data.batch_size, shuffle=True,  num_workers=4)
     val_loader   = DataLoader(valset,   batch_size=conf.data.batch_size, shuffle=False, num_workers=4)
 
+    x_dyn_dim = trainset[0][3].shape[-1]   # dim de x_dyn
+
+    dir_emb = DirEmbedding(output_dim=8).to(DEVICE)
+
     model = BaselineLSTM(
-        hidden_dim     = conf.model.hidden_dim,
-        mode           = conf.model.mode,
-        spatial_dim    = conf.model.get("spatial_dim",    32),
-        dir_dim        = conf.model.get("dir_dim",         8),
-        num_directions = conf.model.get("num_directions",  6),
+        hidden_dim = conf.model.hidden_dim,
+        mode       = conf.model.mode,
+        x_dyn_dim  = x_dyn_dim,
     ).to(DEVICE)
 
-    optimizer = optim.Adam(model.parameters(), lr=conf.model.lr)
+    optimizer = optim.Adam(
+        list(model.parameters()) + list(dir_emb.parameters()),
+        lr=conf.model.lr,
+        )
     criterion = nn.MSELoss()
-    scheduler = LambdaLR(optimizer, lr_lambda=warmup_cosine(conf.model.warmup_epochs, conf.model.epochs))
+    scheduler = LambdaLR(
+        optimizer,
+        lr_lambda=warmup_cosine(conf.model.warmup_epochs, conf.model.epochs),
+    )
 
     save_dir  = ROOT / "save_models" / f"baseline_lstm_{conf.model.mode}"
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -279,6 +268,7 @@ def main(cfg: DictConfig):
             "model":      "BaselineLSTM",
             "mode":       conf.model.mode,
             "hidden_dim": conf.model.hidden_dim,
+            "x_dyn_dim":  x_dyn_dim,
             "lr":         conf.model.lr,
             "batch_size": conf.data.batch_size,
             "twin_idx":   conf.model.twin_idx,
@@ -288,10 +278,9 @@ def main(cfg: DictConfig):
         run_name = mlflow.active_run().info.run_name
         best_val = float("inf")
 
-        epochs_pbar = tqdm(range(conf.model.epochs), desc="Epochs")
-        for epoch in epochs_pbar:
-            tr, tr_p, tr_h = run_epoch(model, train_loader, criterion, conf.model.twin_idx, optimizer)
-            va, va_p, va_h = run_epoch(model, val_loader,   criterion, conf.model.twin_idx)
+        for epoch in (pbar := tqdm(range(conf.model.epochs), desc="Epochs")):
+            tr, tr_p, tr_h = run_epoch(model, train_loader, criterion, conf.model.twin_idx, dir_emb, optimizer)
+            va, va_p, va_h = run_epoch(model, val_loader,   criterion, conf.model.twin_idx, dir_emb)
             scheduler.step()
             lr = scheduler.get_last_lr()[0]
 
@@ -307,14 +296,15 @@ def main(cfg: DictConfig):
                 torch.save({
                     "epoch":      epoch,
                     "model":      model.state_dict(),
+                    "dir_emb":    dir_emb.state_dict(),
                     "optimizer":  optimizer.state_dict(),
                     "scheduler":  scheduler.state_dict(),
                     "mode":       conf.model.mode,
-                    "train_loss": tr, "train_loss_p": tr_p, "train_loss_h": tr_h,
-                    "val_loss":   va, "val_loss_p":   va_p, "val_loss_h":   va_h,
+                    "val_loss":   va,  "val_loss_p":  va_p,  "val_loss_h":  va_h,
+                    "train_loss": tr,  "train_loss_p": tr_p, "train_loss_h": tr_h,
                 }, ckpt_path)
 
-            epochs_pbar.set_postfix(
+            pbar.set_postfix(
                 tr=f"{tr:.4f}", tr_p=f"{tr_p:.4f}", tr_h=f"{tr_h:.4f}",
                 va=f"{va:.4f}", va_p=f"{va_p:.4f}", va_h=f"{va_h:.4f}",
                 lr=f"{lr:.2e}", best=f"{best_val:.4f}",

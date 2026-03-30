@@ -14,16 +14,16 @@ baseline_lstm:
     batch_size:    32
 
   model:
-    hidden_dim:     128
+    hidden_dim:     256
     lr:             1e-3
     warmup_epochs:  5
     epochs:         100
-    twin_idx:       120      # même valeur que head_lstm — séparation obs/horizon
-    mode:    concat
+    twin_idx:       192
+    mode:    dynamic
 
-    spatial_dim:    32
+    spatial_dim:    128
     dir_dim:        8
-    num_directions: 7        # augmenter si direction max >= 6
+    num_directions: 7
 
   mlflow:
-    experiment_name: baseline_lstm
+    experiment_name: baseline_lstm_cap2

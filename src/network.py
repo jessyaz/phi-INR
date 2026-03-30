@@ -46,7 +46,7 @@ class StaticEncoder_LAST(nn.Module):
         )
         spatial = self.spatial_enc(x_statics.float())
         dir_vec = self.dir_embedding(dir_idx)
-        return torch.cat([spatial, dir_vec], dim=-1)#self.norm( torch.cat([spatial, dir_vec], dim=-1) )
+        return torch.cat([spatial, dir_vec], dim=-1)
 
 class StaticEncoder(nn.Module):
     """
@@ -57,9 +57,9 @@ class StaticEncoder(nn.Module):
     def __init__(self, spatial_dim=32, dir_dim=8, num_directions=6, **kwargs):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(2, 64),
+            nn.Linear(4, 32),
             nn.GELU(),
-            nn.Linear(64, spatial_dim),
+            nn.Linear(32, spatial_dim),
         )
         self.dir_embedding = nn.Embedding(num_embeddings=num_directions, embedding_dim=dir_dim)
         self.out_dim       = spatial_dim + dir_dim
@@ -69,7 +69,8 @@ class StaticEncoder(nn.Module):
             f"dir_idx max={dir_idx.max().item()} >= num_directions={self.dir_embedding.num_embeddings}"
         )
         spatial = self.mlp(x_statics.float())
-        dir_vec = self.dir_embedding(dir_idx)
+        dir_vec = self.dir_embedding(dir_idx).unsqueeze(1).repeat(1,spatial.size(1),1)
+
         return torch.cat([spatial, dir_vec], dim=-1)
 
 # ── Hypernetwork avec contexte ────────────────────────────────
@@ -86,28 +87,16 @@ class LatentToModulation(nn.Module):
             print("HN Mode S : ", control)
 
             input_dim = latent_dim + static_emb_dim
-            hidden_dim = input_dim * 2
 
             self.net = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.GELU(),
-                nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, num_modulations)
+                nn.Linear(input_dim, num_modulations)
             )
         else:
 
             input_dim = latent_dim + static_emb_dim + lstm_hidden_dim
-            hidden_dim = input_dim * 2
 
             self.net = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.GELU(),
-                nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, num_modulations)
+                nn.Linear(input_dim, num_modulations)
             )
 
             print("HN Mode : ", control)
@@ -119,24 +108,6 @@ class LatentToModulation(nn.Module):
             return self.net(torch.cat([code, h_t, static_emb], dim=-1))
 
 
-class LatentToModulationCode(nn.Module):
-    """code + h_dynamics + static_emb → modulations FiLM"""
-    def __init__(self, latent_dim, static_emb_dim, num_modulations, control = None):
-        super().__init__()
-
-        self.control = control
-
-        print("HN Mode SUPER : ", control)
-
-        input_dim = latent_dim + static_emb_dim
-        hidden_dim = input_dim * 2
-
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, num_modulations),
-        )
 
 
 # ── Hypernetwork vanilla ──────────────────────────────────────
@@ -154,25 +125,20 @@ class LatentToModulationVanilla(nn.Module):
 # ── Encodage positionnel NeRF ─────────────────────────────────
 
 class NeRFEncoding(nn.Module):
-    def __init__(self, num_frequencies, min_freq, include_input=True, input_dim=1, base_freq=1.25):
+    def __init__(self, num_frequencies, min_freq, input_dim=1, base_freq=1.25):
         super().__init__()
-        self.include_input = include_input
+
         bands              = base_freq * torch.arange(min_freq, num_frequencies, dtype=torch.float32)
         #self.bands         = nn.Parameter(bands, requires_grad=False)
         self.register_buffer('bands', bands)
 
         self.out_dim       = bands.shape[0] * input_dim * 2
 
-        print("CALSS", self.out_dim)
-        if include_input:
-            self.out_dim  += input_dim
-
     def forward(self, coords):
         winded  = coords[..., None, :] * self.bands[None, None, :, None]
         winded  = winded.reshape(*coords.shape[:2], -1)
         encoded = torch.cat([torch.sin(winded), torch.cos(winded)], dim=-1)
-        if self.include_input:
-            encoded = torch.cat([coords, encoded], dim=-1)
+
         return encoded
 
 
@@ -195,7 +161,6 @@ class ModulatedFourierFeatures(nn.Module):
             depth            = 3,
             min_frequencies  = 0,
             base_frequency   = 1.25,
-            include_input    = True,
             is_training      = True,
             use_context      = True,
             freeze_lstm      = False,
@@ -214,7 +179,6 @@ class ModulatedFourierFeatures(nn.Module):
         self.embedding = NeRFEncoding(
             num_frequencies = num_frequencies,
             min_freq        = min_frequencies,
-            include_input   = include_input,
             input_dim       = input_dim,
             base_freq       = base_frequency,
         )
@@ -237,6 +201,7 @@ class ModulatedFourierFeatures(nn.Module):
             self.lstm = LSTM_HEAD(
                 context_dim = LSTM_IN_DIM,
                 hidden_dim  = lstm_hidden_dim,
+
             )
             if freeze_lstm:
                 for p in self.lstm.parameters():
@@ -265,11 +230,6 @@ class ModulatedFourierFeatures(nn.Module):
             num_modulations = num_modulations,
         )
 
-        self.latent_to_mod_code = LatentToModulationCode(
-            latent_dim      = latent_dim,
-            static_emb_dim  = static_emb_dim,
-            num_modulations = num_modulations,
-        )
 
     def load_lstm_weights(self, ckpt_path: str, device='cpu'):
         ckpt = torch.load(ckpt_path, map_location=device)
@@ -293,7 +253,7 @@ class ModulatedFourierFeatures(nn.Module):
             mods = self.latent_to_mod(
                 code,
                 hs[:,t,:],
-                static_emb,
+                static_emb[:,t,:]
             )
             pre_out = film_translate(position[:,t].squeeze(-1), mods, self.layers[:-1], torch.relu)
             post_out     = self.layers[-1](pre_out)
@@ -303,28 +263,12 @@ class ModulatedFourierFeatures(nn.Module):
         return out
 
 
-    def _inr_batch_static_only(self, coords, code, x_statics, dir_idx, special=None):
+    def _inr_batch_static_only(self, coords, code, x_statics, dir_idx):
         B, T, _ = coords.shape
         static_emb = self.static_encoder(x_statics, dir_idx)          # (B, S)
         position   = self.embedding(coords)                            # (B, T, pos_dim)
         out = torch.zeros(B, T, 1, device = coords.device)
 
-        if special == True:
-            for t in range(T):
-
-                mods_code = self.latent_to_mod_vanilla(
-                    code
-                )
-                mods_statique =  self.latent_to_mod_code(
-                    static_emb
-                )
-
-                pre_out = film_translate_spe(position[:,t].squeeze(-1), mods_code,mods_statique, self.layers[:-1], torch.relu)
-                post_out     = self.layers[-1](pre_out)
-
-                out[:,t] = post_out
-
-            return out
 
 
         for t in range(T):
@@ -332,8 +276,9 @@ class ModulatedFourierFeatures(nn.Module):
             mods = self.latent_to_mod(
                 code,
                 [None],
-                static_emb,
+                static_emb[:,t,:],
             )
+
             pre_out = film_translate(position[:,t].squeeze(-1), mods, self.layers[:-1], torch.relu)
             post_out     = self.layers[-1](pre_out)
 
@@ -347,80 +292,13 @@ class ModulatedFourierFeatures(nn.Module):
         position = self.embedding(coords)
 
         out = torch.zeros(B, T, 1, device = coords.device)
+        mods          = self.latent_to_mod_vanilla(code)
 
         for t in range(T):
 
-            mods          = self.latent_to_mod_vanilla(code)
             pre_out = film_translate(position[:,t].squeeze(-1), mods, self.layers[:-1], torch.relu)
             out[:,t] = self.layers[-1](pre_out)
 
         return out
 
 
-    def modulated_forward(self, coords_p, code, x_context_p, y_past,
-                          x_statics=None, dir_idx=None,
-                          coords_h=None, x_context_h=None, beta=0):
-        B, T_p, _ = coords_p.shape
-
-
-        print("P")
-
-        #DEBUG??
-        if not self.use_context:
-            out_p = self._inr_batch_vanilla(coords_p, code)
-            out_h = None
-            if coords_h is not None:
-                out_h = self._inr_batch_vanilla(coords_h, code)
-            return out_p, out_h, torch.tensor(0.0, device=coords_p.device)
-
-        # ── Contexte LSTM ─────────────────────────────────────────
-        assert dir_idx   is not None, "dir_idx requis quand use_context=True"
-        assert x_statics is not None, "x_statics requis quand use_context=True"
-
-        if self._debug:
-            print("  [context] LSTM forward_past...")
-        hs_p, h_final, c_final = self.lstm.forward_past(x_context_p, y_past)
-
-        if self._debug:
-            print(f"  hs_p         : {tuple(hs_p.shape)}  nan={hs_p.isnan().any().item()}  norm={hs_p.norm():.4f}")
-            print(f"  h_final      : {tuple(h_final.shape)}  nan={h_final.isnan().any().item()}")
-            print("  [context] _inr_batch série P...")
-        out_p = self._inr_batch(coords_p, code, hs_p, x_statics, dir_idx)
-
-        if self._debug:
-            print(f"  out_p        : {tuple(out_p.shape)}  nan={out_p.isnan().any().item()}  "
-                  f"min={out_p.min():.4f} max={out_p.max():.4f}")
-
-        out_h = None
-        if coords_h is not None:
-            if self._debug:
-                print(f"  [context] série H AR — {coords_h.shape[1]} pas...")
-
-            T_h       = coords_h.shape[1]
-            h, c      = h_final, c_final
-            last_flow = out_p[:, -1, :]
-            hs_h      = []
-
-            for t in range(T_h):
-                h_since = torch.full((B, 1), (t + 1) / 24.0, device=coords_h.device)
-                x_in    = torch.cat([x_context_h[:, t, :], last_flow, h_since], dim=-1)
-
-                h, c = self.lstm.cell_step(x_in, h, c)
-
-                if h.isnan().any():
-                    print(f"    ⚠ NaN dans h à t={t}")
-                    break
-
-                hs_h.append(h.unsqueeze(1))
-
-            hs_h = torch.cat(hs_h, dim=1)
-            if self._debug:
-                print(f"  hs_h         : {tuple(hs_h.shape)}  nan={hs_h.isnan().any().item()}  norm={hs_h.norm():.4f}")
-
-            out_h = self._inr_batch(coords_h, code, hs_h, x_statics, dir_idx)
-            if self._debug:
-                print(f"  out_h        : {tuple(out_h.shape)}  nan={out_h.isnan().any().item()}  "
-                  f"min={out_h.min():.4f} max={out_h.max():.4f}")
-        if self._debug:
-            print("[MFF.modulated_forward] ✓ done\n")
-        return out_p, out_h, torch.tensor(0.0, device=coords_p.device)

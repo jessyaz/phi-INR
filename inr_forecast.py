@@ -22,6 +22,11 @@ from src.network import ModulatedFourierFeatures
 from src.snapshot import save_snapshot
 
 
+from torch.optim.lr_scheduler import LambdaLR
+
+from src.snapshot import save_snapshot
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Construction du modèle
 # ══════════════════════════════════════════════════════════════════════════════
@@ -42,7 +47,6 @@ def build_model(cfg: DictConfig, device: torch.device) -> ModulatedFourierFeatur
         depth            = cfg.inr.depth,
         min_frequencies  = cfg.inr.min_frequencies,
         base_frequency   = cfg.inr.base_frequency,
-        include_input    = cfg.inr.include_input,
         is_training      = True,
         use_context      = cfg.inr.use_context,
         freeze_lstm      = cfg.inr.get('freeze_lstm', False),
@@ -54,6 +58,18 @@ def build_model(cfg: DictConfig, device: torch.device) -> ModulatedFourierFeatur
 # Époque d'entraînement / validation
 # ══════════════════════════════════════════════════════════════════════════════
 
+def compute_metrics(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        eps: float = 1e-8,
+) -> dict[str, float]:
+    """MAE, RMSE et MAPE sur le tenseur brut (N, T, D)."""
+    mae  = (pred - target).abs().mean().item()
+    rmse = ((pred - target) ** 2).mean().sqrt().item()
+    mape = ((pred - target).abs() / (target.abs() + eps)).mean().item() * 100.0
+    return {"mae": mae, "rmse": rmse, "mape": mape}
+
+
 def run_epoch(
         inr:       nn.Module,
         loader:    DataLoader,
@@ -62,24 +78,29 @@ def run_epoch(
         cfg:       DictConfig,
         device:    torch.device,
         is_train:  bool = True,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, dict[str, float]]:
 
     inr.train() if is_train else inr.eval()
     look_back   = cfg.data.look_back_window
     use_context = cfg.inr.use_context
     total, total_p, total_h, n = 0.0, 0.0, 0.0, 0
 
+    # Accumulateurs pour les métriques de validation
+    all_preds, all_targets = [], []
+
     with torch.set_grad_enabled(is_train):
         pbar = tqdm(loader, leave=False, desc="train" if is_train else "val  ")
         for batch in pbar:
-            t, dir_idx, x_static, x_meteo, x_time, y, code = batch
+            t, dir_idx, x_statics, x_meteo, x_time, y, code = batch
 
-            x_context = torch.cat([x_meteo, x_time], dim=-1).to(device)
+            x_context = x_meteo.to(device)
             y_target  = y.to(device)
             t         = t.to(device)
             code      = code.to(device)
 
-            x_statics = x_static.to(device) if use_context else None
+            x_statics = torch.concat([x_statics.unsqueeze(1).repeat(1,x_time.size(1),1), x_time] , dim = -1)
+
+            x_statics = x_statics.to(device) if use_context else None
             dir_idx   = dir_idx.to(device)  if use_context else None
 
             coords_p    = t[:, :look_back, :]
@@ -112,6 +133,10 @@ def run_epoch(
                 outputs['loss'].backward()
                 nn.utils.clip_grad_value_(inr.parameters(), cfg.optim.clip_grad_value)
                 optimizer.step()
+            else:
+                all_preds.append(outputs['out_h'].detach().cpu())
+                all_targets.append(y_horizon.detach().cpu())
+
 
             bs       = coords_p.shape[0]
             total   += outputs['loss'].item()   * bs
@@ -124,7 +149,14 @@ def run_epoch(
                 h=f"{outputs['loss_h'].item():.4f}",
             )
 
-    return total / n, total_p / n, total_h / n
+
+    val_metrics: dict[str, float] = {}
+    if not is_train and all_preds:
+        preds   = torch.cat(all_preds,   dim=0)
+        targets = torch.cat(all_targets, dim=0)
+        val_metrics = compute_metrics(preds, targets)
+
+    return total / n, total_p / n, total_h / n, val_metrics
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -203,11 +235,28 @@ def main(cfg: DictConfig):
     optimizer = torch.optim.AdamW(
         inr.parameters(),
         lr           = cfg.optim.lr_inr,
-        weight_decay = cfg.optim.weight_decay,
+    #    weight_decay = cfg.optim.weight_decay,
     )
+
+    def warmup_cosine(warmup_epochs, total_epochs):
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+            return 0.5 * (1.0 + torch.cos(torch.tensor(3.14159 * progress)).item())
+        return lr_lambda
+
     scheduler = (
         CosineAnnealingLR(optimizer, T_max=cfg.optim.t_max)
         if cfg.optim.scheduler == "cosine" else None
+    )
+
+    scheduler = LambdaLR(
+        optimizer,
+        lr_lambda=warmup_cosine(
+            10, #cfg.optim.warmup_epochs
+            100 #cfg.optim.epochs
+        )
     )
 
     # ── MLflow ────────────────────────────────────────────────────────────────
@@ -243,10 +292,10 @@ def main(cfg: DictConfig):
         ckpt_path = None
 
         for epoch in tqdm(range(cfg.optim.epochs), desc="Epochs"):
-            tr, tr_p, tr_h = run_epoch(
+            tr, tr_p, tr_h, _ = run_epoch(
                 inr, train_loader, alpha, optimizer, cfg, device, is_train=True
             )
-            va, va_p, va_h = run_epoch(
+            va, va_p, va_h, val_metrics = run_epoch(
                 inr, val_loader, alpha, None, cfg, device, is_train=False
             )
 
@@ -255,9 +304,10 @@ def main(cfg: DictConfig):
 
             mlflow.log_metrics(
                 {
-                    #"lr":         scheduler.get_last_lr()[0],
+                    "lr":         scheduler.get_last_lr()[0],
                     'train_loss':   tr,  'train_loss_p': tr_p, 'train_loss_h': tr_h,
                     'val_loss':     va,  'val_loss_p':   va_p, 'val_loss_h':   va_h,
+                    **{f"val_{k}": v for k, v in val_metrics.items()},
                 },
                 step=epoch,
             )
@@ -280,6 +330,7 @@ def main(cfg: DictConfig):
                         # Schéma de données au moment du run
                         'data_schema_fp':  fp,
                         # Poids
+                        'alpha':           alpha.item(),
                         'inr_state_dict':  inr.state_dict(),
                         'optimizer':       optimizer.state_dict(),
                         # Métriques
@@ -287,6 +338,10 @@ def main(cfg: DictConfig):
                         'train_loss':      tr,  'train_loss_p': tr_p,  'train_loss_h':tr_h,
                         'static_encoder_type': type(inr.static_encoder).__name__,
                         'has_norm':            hasattr(inr.static_encoder, 'norm'),
+
+                        'val_mae':         val_metrics.get('mae'),
+                        'val_rmse':        val_metrics.get('rmse'),
+                        'val_mape':        val_metrics.get('mape')
                     },
                     ckpt_path,
                 )
