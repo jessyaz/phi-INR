@@ -5,6 +5,7 @@ Ce fichier est copié tel quel dans chaque run_dir/.
 Usage:
     python evaluate.py --parquet /chemin/vers/test.parquet
     python evaluate.py --parquet /chemin/vers/test.parquet --batch-size 64 --quiet
+    python evaluate.py --parquet /chemin/vers/test.parquet --no-site-filter
 """
 import sys
 import argparse
@@ -65,26 +66,54 @@ def _build_model(cfg_inr, cfg_data, device: torch.device) -> ModulatedFourierFea
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Construction du contexte statique (cohérent avec train.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_context(x_statics, x_time, use_context, control, device):
+    """
+    Reproduit exactement la logique de build_context() de train.py.
+    control :
+      None / use_context=False → None  (vanilla)
+      "static_only"            → geo seulement (x_statics)
+      "dynamic_only"           → time seulement (x_time)
+      "dynamic"                → geo + time (concat complet)
+    """
+    if not use_context:
+        return None
+
+    T = x_time.size(1)
+
+    if control == "static_only":
+        return x_statics.unsqueeze(1).repeat(1, T, 1).to(device)
+
+    if control == "dynamic_only":
+        return x_time.to(device)
+
+    # "dynamic" ou tout autre valeur → concat complet
+    return torch.concat(
+        [x_statics.unsqueeze(1).repeat(1, T, 1), x_time], dim=-1
+    ).to(device)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Évaluation principale
 # ══════════════════════════════════════════════════════════════════════════════
 
 def evaluate(
-        parquet_path: str,
-        batch_size:   int  = 32,
-        num_workers:  int  = 0,
-        quiet:        bool = False,
+        parquet_path:     str,
+        batch_size:       int  = 32,
+        num_workers:      int  = 0,
+        quiet:            bool = False,
+        skip_site_filter: bool = False,
 ) -> dict:
-    """
-    Charge le checkpoint figé, évalue sur parquet_path.
-    Retourne {"mae": float, "rmse": float, "mape": float}.
-    """
     def log(msg: str) -> None:
         if not quiet:
             print(msg)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log(f"Device  : {device}")
-    log(f"Parquet : {parquet_path}")
+    log(f"Device           : {device}")
+    log(f"Parquet          : {parquet_path}")
+    log(f"skip_site_filter : {skip_site_filter}")
 
     # ── Checkpoint ────────────────────────────────────────────────────────────
     ckpt_files = sorted(SNAPSHOT_DIR.glob("*_best.pt"))
@@ -100,8 +129,12 @@ def evaluate(
     cfg_inner = OmegaConf.create(ckpt["cfg_inner"])
     cfg_optim = OmegaConf.create(ckpt["cfg_optim"])
 
-    # Vérification schéma de données (guard contre mauvais parquet)
-    from src.dataloaders import schema_fingerprint, check_compat
+    control     = cfg_inr.get("control", None)
+    use_context = cfg_inr.use_context
+    log(f"Control : {control}  |  use_context : {use_context}")
+
+    # ── Vérification schéma ───────────────────────────────────────────────────
+    from src.dataloaders import check_compat
     saved_fp = ckpt.get("data_schema_fp", {})
     diffs    = check_compat(saved_fp)
     if diffs:
@@ -115,10 +148,20 @@ def evaluate(
     # ── Dataset ───────────────────────────────────────────────────────────────
     testset = NZDataset(
         parquet_path,
-        mode       = "val",       # val = transform-only, scalers fournis
-        latent_dim = cfg_inr.latent_dim,
-        scalers    = scalers,
+        mode             = "val",
+        latent_dim       = cfg_inr.latent_dim,
+        scalers          = scalers,
+        skip_site_filter = skip_site_filter,
     )
+
+    if len(testset) == 0:
+        raise RuntimeError(
+            "Le dataset est vide après chargement.\n"
+            "  • Relancer avec --no-site-filter si parquet externe\n"
+            "  • Vérifier que les séries sont assez longues\n"
+            f"  Parquet : {parquet_path}"
+        )
+
     loader = DataLoader(
         testset,
         batch_size  = batch_size,
@@ -133,12 +176,10 @@ def evaluate(
     model.eval()
     model._debug = False
 
-    # alpha figé (valeur apprise ou fallback sur lr_code)
     alpha_val = ckpt.get("alpha", cfg_optim.lr_code)
     alpha     = torch.tensor([alpha_val], device=device)
 
-    look_back   = cfg_data.look_back_window
-    use_context = cfg_inr.use_context
+    look_back    = cfg_data.look_back_window
     all_preds, all_targets = [], []
 
     # ── Inférence ─────────────────────────────────────────────────────────────
@@ -152,11 +193,15 @@ def evaluate(
             t         = t.to(device)
             code      = code.to(device)
 
-            x_statics = torch.concat(
-                [x_statics.unsqueeze(1).repeat(1, x_time.size(1), 1), x_time], dim=-1
+            # ── Contexte statique selon le mode ───────────────────────────────
+            x_statics_in = _build_context(
+                x_statics   = x_statics,
+                x_time      = x_time,
+                use_context = use_context,
+                control     = control,
+                device      = device,
             )
-            x_statics = x_statics.to(device) if use_context else None
-            dir_idx   = dir_idx.to(device)   if use_context else None
+            dir_idx_in = dir_idx.to(device) if use_context else None
 
             coords_p    = t[:, :look_back, :]
             coords_h    = t[:, look_back:, :]
@@ -179,27 +224,43 @@ def evaluate(
                 w_futur     = cfg_inner.w_futur,
                 is_train    = False,
                 code        = torch.zeros_like(code),
-                x_statics   = x_statics,
-                dir_idx     = dir_idx,
+                x_statics   = x_statics_in,
+                dir_idx     = dir_idx_in,
             )
 
             if "out_h" not in outputs:
                 raise RuntimeError(
-                    "outer_step ne retourne pas 'out_h'. "
+                    "outer_step ne retourne pas 'out_h'.\n"
                     "Ajouter la clé dans src/metalearning.py."
                 )
 
             all_preds.append(outputs["out_h"].detach().cpu())
             all_targets.append(y_horizon.detach().cpu())
 
-    preds   = torch.cat(all_preds,   dim=0)
-    targets = torch.cat(all_targets, dim=0)
+    if not all_preds:
+        raise RuntimeError("Aucune prédiction collectée malgré un dataset non vide.")
+
+    preds   = torch.cat(all_preds,   dim=0)   # (N, T_horizon, 1) — normalisé
+    targets = torch.cat(all_targets, dim=0)   # (N, T_horizon, 1) — normalisé
+
+    # ── Inverse-transform → espace original ──────────────────────────────────
+    scaler_t = scalers["target"]
+
+    def inverse(tensor: torch.Tensor) -> torch.Tensor:
+        shape = tensor.shape
+        flat  = tensor.reshape(-1, 1).numpy()
+        flat  = scaler_t.inverse_transform(flat)
+        return torch.from_numpy(flat).reshape(shape)
+
+    preds   = inverse(preds)
+    targets = inverse(targets)
+
     metrics = compute_metrics(preds, targets)
 
-    log("\n── Métriques ──────────────────────────")
+    log("\n── Métriques (espace original) ─────────────────")
     for k, v in metrics.items():
         log(f"  {k.upper():>6} : {v:.6f}")
-    log("────────────────────────────────────────")
+    log("────────────────────────────────────────────────")
 
     return metrics
 
@@ -210,13 +271,20 @@ def evaluate(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Évalue un snapshot figé")
-    parser.add_argument("--parquet",     required=True,      help="Chemin vers le .parquet de test")
-    parser.add_argument("--batch-size",  type=int, default=32)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--quiet",       action="store_true", help="Supprime les prints (garde le JSON final)")
-    args = parser.parse_args()
+    parser.add_argument("--parquet",        required=True,      help="Chemin vers le .parquet de test")
+    parser.add_argument("--batch-size",     type=int, default=32)
+    parser.add_argument("--num-workers",    type=int, default=0)
+    parser.add_argument("--quiet",          action="store_true")
+    parser.add_argument("--no-site-filter", action="store_true", help="Désactive le filtre splits_meta.json")
+    # parse_known_args absorbe les flags inconnus transmis par compare_runs.py
+    args, _ = parser.parse_known_args()
 
-    metrics = evaluate(args.parquet, args.batch_size, args.num_workers, args.quiet)
+    metrics = evaluate(
+        args.parquet,
+        args.batch_size,
+        args.num_workers,
+        args.quiet,
+        skip_site_filter=args.no_site_filter,
+    )
 
-    # Toujours printer le JSON en dernière ligne (parsé par compare_runs.py)
     print("JSON:" + _json.dumps(metrics))

@@ -7,10 +7,10 @@ def inner_loop_step(func_rep, code, coords, hs_p, x_statics, dir_idx,
     loss_fn = nn.MSELoss()
 
     with torch.enable_grad():
-        if func_rep.use_context and func_rep.control != "static_only":
-            out_p = func_rep._inr_batch(coords, code, hs_p, x_statics, dir_idx)
-        elif func_rep.use_context and func_rep.control == "static_only":
+        if func_rep.use_context and func_rep.control == "static_only":
             out_p = func_rep._inr_batch_static_only(coords, code, x_statics, dir_idx)
+        elif func_rep.use_context and func_rep.control in ("dynamic", "dynamic_only"):
+            out_p = func_rep._inr_batch(coords, code, hs_p, x_statics, dir_idx)
         else:
             out_p = func_rep._inr_batch_vanilla(coords, code)
 
@@ -52,8 +52,10 @@ def outer_step(
         code = torch.zeros(B, func_rep.latent_dim, device=coords_p.device)
     code = code.detach().requires_grad_(True)
 
-    use_lstm   = func_rep.use_context and func_rep.control != "static_only"
-    use_static = func_rep.use_context and func_rep.control == "static_only"
+    control          = func_rep.control
+    use_lstm         = func_rep.use_context and control in ("dynamic", "dynamic_only")
+    use_static_only  = func_rep.use_context and control == "static_only"
+    use_dynamic_only = func_rep.use_context and control == "dynamic_only"
 
     # ── Pré-calcul hs_p pour l'inner-loop ────────────────────────────────────
     if use_lstm:
@@ -73,38 +75,53 @@ def outer_step(
         T_h    = coords_h.shape[1]
         flow_h = torch.zeros(B, T_h, device=coords_h.device)
 
-        if use_lstm:
-            # Recalcul propre avec grad enabled si is_train
+        if use_lstm and not use_dynamic_only:
+            # ── Full model (dynamic + static) ─────────────────────────────────
             hs_p, h_final, c_final = func_rep.lstm.forward_past(x_context_p, y_past)
             out_p = func_rep._inr_batch(coords_p, code, hs_p, x_statics, dir_idx)
 
-            h, c   = h_final, c_final
-            out_h  = out_p[:, -1, :]          # amorce : dernier pas prédit du passé
-            hs_h   = torch.zeros(B, T_h, h.shape[-1], device=coords_h.device)
-
-            # Contexte fixe pour toute la phase H : dernier pas observé du passé
-            x_ctx_last  = x_context_p[:, -1, :]
-
+            h, c         = h_final, c_final
+            out_h        = out_p[:, -1, :]
+            x_ctx_last   = x_context_p[:, -1, :]
 
             for t in range(T_h):
-
-                x_in = torch.cat([x_ctx_last, out_h], dim=-1)
-                h, c = func_rep.lstm.cell_step(x_in, h, c)
-
+                x_in  = torch.cat([x_ctx_last, out_h], dim=-1)
+                h, c  = func_rep.lstm.cell_step(x_in, h, c)
                 out_h = func_rep._inr_batch(
                     coords_h[:, t].unsqueeze(-1), code, h.unsqueeze(1), x_statics, dir_idx,
                 ).squeeze(1)
-
-                hs_h[:, t, :]  = h
-                flow_h[:, t]   = out_h.squeeze(-1)
+                flow_h[:, t] = out_h.squeeze(-1)
 
             flow_h = flow_h.unsqueeze(-1)
 
-        elif use_static:
+        elif use_dynamic_only:
+            # ── Dynamic only (LSTM sans static) ──────────────────────────────
+            hs_p, h_final, c_final = func_rep.lstm.forward_past(x_context_p, y_past)
+            out_p = func_rep._inr_batch(coords_p, code, hs_p,
+                                        x_statics=None, dir_idx=None)
+
+            h, c         = h_final, c_final
+            out_h        = out_p[:, -1, :]
+            x_ctx_last   = x_context_p[:, -1, :]
+
+            for t in range(T_h):
+                x_in  = torch.cat([x_ctx_last, out_h], dim=-1)
+                h, c  = func_rep.lstm.cell_step(x_in, h, c)
+                out_h = func_rep._inr_batch(
+                    coords_h[:, t].unsqueeze(-1), code, h.unsqueeze(1),
+                    x_statics=None, dir_idx=None,
+                ).squeeze(1)
+                flow_h[:, t] = out_h.squeeze(-1)
+
+            flow_h = flow_h.unsqueeze(-1)
+
+        elif use_static_only:
+            # ── Static only (pas de LSTM) ─────────────────────────────────────
             out_p  = func_rep._inr_batch_static_only(coords_p, code, x_statics, dir_idx)
             flow_h = func_rep._inr_batch_static_only(coords_h, code, x_statics, dir_idx)
 
-        else:  # vanilla
+        else:
+            # ── Vanilla / TimeFlow ────────────────────────────────────────────
             out_p  = func_rep._inr_batch_vanilla(coords_p, code)
             flow_h = func_rep._inr_batch_vanilla(coords_h, code)
 
@@ -118,6 +135,5 @@ def outer_step(
         "loss_h": loss_h,
         "code":   code.detach(),
         "out_p":  out_p.detach(),
-        "out_h":  flow_h.detach()
-
+        "out_h":  flow_h.detach(),
     }

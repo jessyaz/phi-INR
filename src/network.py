@@ -76,34 +76,25 @@ class StaticEncoder(nn.Module):
 # ── Hypernetwork avec contexte ────────────────────────────────
 
 class LatentToModulation(nn.Module):
-    """code + h_dynamics + static_emb → modulations FiLM"""
-    def __init__(self, latent_dim, lstm_hidden_dim, static_emb_dim, num_modulations, control = None):
+    def __init__(self, latent_dim, lstm_hidden_dim, static_emb_dim, num_modulations, control=None):
         super().__init__()
-
         self.control = control
 
-
         if control == "static_only":
-            print("HN Mode S : ", control)
-
             input_dim = latent_dim + static_emb_dim
-
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, num_modulations)
-            )
+        elif control == "dynamic_only":      # ← NOUVEAU
+            input_dim = latent_dim + lstm_hidden_dim
         else:
-
             input_dim = latent_dim + static_emb_dim + lstm_hidden_dim
 
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, num_modulations)
-            )
-
-            print("HN Mode : ", control)
+        self.net = nn.Sequential(nn.Linear(input_dim, num_modulations))
+        print("HN Mode : ", control)
 
     def forward(self, code, h_t, static_emb):
         if self.control == "static_only":
             return self.net(torch.cat([code, static_emb], dim=-1))
+        elif self.control == "dynamic_only":   # ← NOUVEAU
+            return self.net(torch.cat([code, h_t], dim=-1))
         else:
             return self.net(torch.cat([code, h_t, static_emb], dim=-1))
 

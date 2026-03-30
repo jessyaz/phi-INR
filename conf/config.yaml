@@ -2,8 +2,10 @@ defaults:
   - _self_
 
 meta:
-  experiment_pack: AugC-INR2
+  experiment_pack: AugC-INR3
 
+  run_name:  null
+  seed:      42
 
 inference:
   ckpt: save_models/inr/vanilla/sneaky-stag-351_20260313_1714_best.pt
@@ -35,9 +37,12 @@ data:
   pin_memory:       true
 
 inr:
-  control:          "dynamic" #"static_only"
-  use_context:      true    # false = INR vanilla (sans LSTM ni static)
-  freeze_lstm:      false   # true = gèle poids LSTM
+  control:              "dynamic"
+  use_context:          true
+  use_static_context:   true    # ← ablation : features géo-statiques
+  use_dynamic_context:  true    # ← ablation : features temporelles (x_time)
+  freeze_lstm:          false
+
   lstm_ckpt:        null #save_models/head_lstm/debonair-wolf-926_h256_20260316_1006_best.pt # null    # "save_models/head_lstm/run_xxx_best.pt" ou null
   lstm_hidden_dim:  256
   latent_dim:       256 # DIM CODE #512
