@@ -43,6 +43,7 @@ def outer_step(
         x_statics = None,
         dir_idx   = None,
         beta      = 0,
+        tf_ratio  = 0.0,
 ):
     loss_fn = nn.MSELoss()
     func_rep.zero_grad()
@@ -80,17 +81,27 @@ def outer_step(
             hs_p, h_final, c_final = func_rep.lstm.forward_past(x_context_p, y_past)
             out_p = func_rep._inr_batch(coords_p, code, hs_p, x_statics, dir_idx)
 
-            h, c         = h_final, c_final
-            out_h        = out_p[:, -1, :]
-            x_ctx_last   = x_context_p[:, -1, :]
+            h, c       = h_final, c_final
+            out_h      = out_p[:, -1, :]
+            x_ctx_last = x_context_p[:, -1, :]
 
             for t in range(T_h):
                 x_in  = torch.cat([x_ctx_last, out_h], dim=-1)
                 h, c  = func_rep.lstm.cell_step(x_in, h, c)
-                out_h = func_rep._inr_batch(
-                    coords_h[:, t].unsqueeze(-1), code, h.unsqueeze(1), x_statics, dir_idx,
+
+                pred_h = func_rep._inr_batch(
+                    coords_h[:, t].unsqueeze(-1), code, h.unsqueeze(1),
+                    x_statics, dir_idx,
                 ).squeeze(1)
-                flow_h[:, t] = out_h.squeeze(-1)
+
+                # Loss calculée sur la prédiction pure
+                flow_h[:, t] = pred_h.squeeze(-1)
+
+                # Entrée du pas suivant : GT (TF) ou prédiction (AR)
+                if is_train and tf_ratio > 0.0 and torch.rand(1).item() < tf_ratio:
+                    out_h = y_horizon[:, t, :]
+                else:
+                    out_h = pred_h
 
             flow_h = flow_h.unsqueeze(-1)
 
@@ -100,18 +111,27 @@ def outer_step(
             out_p = func_rep._inr_batch(coords_p, code, hs_p,
                                         x_statics=None, dir_idx=None)
 
-            h, c         = h_final, c_final
-            out_h        = out_p[:, -1, :]
-            x_ctx_last   = x_context_p[:, -1, :]
+            h, c       = h_final, c_final
+            out_h      = out_p[:, -1, :]
+            x_ctx_last = x_context_p[:, -1, :]
 
             for t in range(T_h):
                 x_in  = torch.cat([x_ctx_last, out_h], dim=-1)
                 h, c  = func_rep.lstm.cell_step(x_in, h, c)
-                out_h = func_rep._inr_batch(
+
+                pred_h = func_rep._inr_batch(
                     coords_h[:, t].unsqueeze(-1), code, h.unsqueeze(1),
                     x_statics=None, dir_idx=None,
                 ).squeeze(1)
-                flow_h[:, t] = out_h.squeeze(-1)
+
+                # Loss calculée sur la prédiction pure
+                flow_h[:, t] = pred_h.squeeze(-1)
+
+                # Entrée du pas suivant : GT (TF) ou prédiction (AR)
+                if is_train and tf_ratio > 0.0 and torch.rand(1).item() < tf_ratio:
+                    out_h = y_horizon[:, t, :]
+                else:
+                    out_h = pred_h
 
             flow_h = flow_h.unsqueeze(-1)
 

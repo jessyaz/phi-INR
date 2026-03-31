@@ -18,7 +18,10 @@ import subprocess
 from pathlib import Path
 
 
-METRIC_KEYS = ["mae", "rmse", "mape"]
+METRIC_KEYS = [
+    "past_mae", "past_rmse", "past_mape", "past_smape",
+    "horizon_mae", "horizon_rmse", "horizon_mape", "horizon_smape",
+]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -65,27 +68,46 @@ def _eval_snapshot(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _print_table(results: dict[str, dict]) -> None:
-    col_run  = 45
-    col_val  = 13
-    sep_len  = col_run + col_val * len(METRIC_KEYS)
+    col_run = 35
+    col_val = 11
 
-    header = f"{'Run':<{col_run}}" + "".join(f"{k.upper():>{col_val}}" for k in METRIC_KEYS)
+    # Deux groupes : passé et horizon
+    past_keys    = ["past_mae",    "past_rmse",    "past_mape",    "past_smape"]
+    horizon_keys = ["horizon_mae", "horizon_rmse", "horizon_mape", "horizon_smape"]
+    labels       = ["MAE", "RMSE", "MAPE", "SMAPE"]
+
+    sep_len = col_run + col_val * len(labels) * 2 + 6
+
     print("\n" + "═" * sep_len)
     print("COMPARAISON")
     print("═" * sep_len)
-    print(header)
+    print(
+        f"{'Run':<{col_run}}  "
+        f"{'── PASSÉ (192h) ──':^{col_val * len(labels)}}  "
+        f"{'── HORIZON (48h) ──':^{col_val * len(labels)}}"
+    )
+    print(
+        f"{'':< {col_run}}  " +
+        "".join(f"{l:>{col_val}}" for l in labels) + "  " +
+        "".join(f"{l:>{col_val}}" for l in labels)
+    )
     print("─" * sep_len)
 
-    best: dict[str, tuple[str, float]] = {k: ("", float("inf")) for k in METRIC_KEYS}
+    best = {k: ("", float("inf")) for k in past_keys + horizon_keys}
 
     for run_name, res in results.items():
         short = run_name[-col_run:] if len(run_name) > col_run else run_name
         if "error" in res:
             print(f"{short:<{col_run}}  ✗  {res['error']}")
         else:
-            vals = [res.get(k, float("nan")) for k in METRIC_KEYS]
-            print(f"{short:<{col_run}}" + "".join(f"{v:>{col_val}.6f}" for v in vals))
-            for k, v in zip(METRIC_KEYS, vals):
+            past_vals    = [res.get(k, float("nan")) for k in past_keys]
+            horizon_vals = [res.get(k, float("nan")) for k in horizon_keys]
+            row = f"{short:<{col_run}}  "
+            row += "".join(f"{v:>{col_val}.4f}" for v in past_vals)
+            row += "  "
+            row += "".join(f"{v:>{col_val}.4f}" for v in horizon_vals)
+            print(row)
+            for k, v in zip(past_keys + horizon_keys, past_vals + horizon_vals):
                 if v < best[k][1]:
                     best[k] = (run_name, v)
 
@@ -93,8 +115,8 @@ def _print_table(results: dict[str, dict]) -> None:
     print("Meilleur par métrique :")
     for k, (name, val) in best.items():
         if name:
-            short = name[-col_run:] if len(name) > col_run else name
-            print(f"  {k.upper():>6} → {short}  ({val:.6f})")
+            short = name[-col_run:] if len(run_name) > col_run else name
+            print(f"  {k:>20} → {short}  ({val:.4f})")
     print("═" * sep_len)
 
 
@@ -112,6 +134,9 @@ def main() -> None:
     parser.add_argument("--no-site-filter", action="store_true", help="Désactive le filtre splits_meta.json")
     args = parser.parse_args()
 
+    past_keys    = ["past_mae",    "past_rmse",    "past_mape",    "past_smape"]
+    horizon_keys = ["horizon_mae", "horizon_rmse", "horizon_mape", "horizon_smape"]
+
     results: dict[str, dict] = {}
 
     for run_path_str in args.runs:
@@ -126,7 +151,8 @@ def main() -> None:
         if "error" in metrics:
             print(f"    ✗  {metrics['error']}")
         else:
-            print("    " + "  ".join(f"{k.upper()}={metrics[k]:.6f}" for k in METRIC_KEYS))
+            print("    PASSÉ   : " + "  ".join(f"{k.split('_')[1].upper()}={metrics[k]:.4f}" for k in past_keys if k in metrics))
+            print("    HORIZON : " + "  ".join(f"{k.split('_')[1].upper()}={metrics[k]:.4f}" for k in horizon_keys if k in metrics))
 
     _print_table(results)
 

@@ -1,5 +1,5 @@
 from pathlib import Path
-import os, sys, warnings, random
+import os, sys, warnings, random, math
 warnings.filterwarnings("ignore")
 
 ROOT = Path(__file__).parent
@@ -11,7 +11,7 @@ import mlflow
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from datetime import datetime
@@ -41,34 +41,8 @@ def set_seed(seed: int) -> None:
 # Construction du modèle
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _effective_spatial_dim(cfg: DictConfig) -> int:
-    """
-    Calcule la dim réelle du vecteur de contexte statique passé au modèle,
-    selon les flags d'ablation :
-
-      use_static_context  : inclut les features géo-statiques  (COL_STATIC)
-      use_dynamic_context : inclut les features temporelles     (x_time)
-
-    Les deux flags sont optionnels et valent True par défaut
-    (comportement inchangé si absents de la config).
-    """
-    from src.dataloaders import STAT_DIM, X_TIME_DIM
-    use_static  = cfg.inr.get("use_static_context",  True)
-    use_dynamic = cfg.inr.get("use_dynamic_context", True)
-    dim = 0
-    if use_static:
-        dim += STAT_DIM
-    if use_dynamic:
-        dim += X_TIME_DIM
-    return dim
-
-
 def build_model(cfg: DictConfig, device: torch.device) -> ModulatedFourierFeatures:
-    spatial_dim = _effective_spatial_dim(cfg)
-    print(f"[Ablation] use_static_context  = {cfg.inr.get('use_static_context',  True)}")
-    print(f"[Ablation] use_dynamic_context = {cfg.inr.get('use_dynamic_context', True)}")
-    print(f"[Ablation] spatial_dim effectif = {spatial_dim}")
-
+    print(f"[Model] spatial_dim={cfg.inr.static.spatial_dim}  control={cfg.inr.get('control', None)}")
     return ModulatedFourierFeatures(
         input_dim        = cfg.data.input_dim,
         output_dim       = cfg.data.output_dim,
@@ -76,7 +50,7 @@ def build_model(cfg: DictConfig, device: torch.device) -> ModulatedFourierFeatur
         num_frequencies  = cfg.inr.num_frequencies,
         latent_dim       = cfg.inr.latent_dim,
         lstm_hidden_dim  = cfg.inr.lstm_hidden_dim,
-        spatial_dim      = spatial_dim,                   # ← calculé dynamiquement
+        spatial_dim      = cfg.inr.static.spatial_dim,   # ← toujours 128
         dir_dim          = cfg.inr.static.dir_dim,
         num_directions   = cfg.inr.static.num_directions,
         sigma            = cfg.inr.static.sigma,
@@ -92,45 +66,36 @@ def build_model(cfg: DictConfig, device: torch.device) -> ModulatedFourierFeatur
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Construction du vecteur de contexte statique (ablation-aware)
+# Construction du vecteur de contexte statique
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_context(
         x_statics:   torch.Tensor,   # (B, STAT_DIM)
         x_time:      torch.Tensor,   # (B, T, X_TIME_DIM)
         use_context: bool,
-        use_static:  bool,
-        use_dynamic: bool,
         device:      torch.device,
 ) -> torch.Tensor | None:
     """
-    Retourne le tenseur x_statics (B, T, dim) passé au modèle,
-    ou None si aucun contexte.
-
-    Variants d'ablation :
-      use_context=False                        → None          (Vanilla / TimeFlow)
-      use_context=True, static=T, dynamic=T   → geo + time    (Full model)
-      use_context=True, static=T, dynamic=F   → geo only      (Static only)
-      use_context=True, static=F, dynamic=T   → time only     (Dynamic only)
+    Retourne toujours le concat geo+time (dim 4) au StaticEncoder.
+    Le routing ablation est géré par control dans LatentToModulation.
     """
     if not use_context:
         return None
-
     T = x_time.size(1)
-    parts = []
+    return torch.concat(
+        [x_statics.unsqueeze(1).repeat(1, T, 1), x_time], dim=-1
+    ).to(device)
 
-    if use_static:
-        # (B, STAT_DIM) → (B, T, STAT_DIM)
-        parts.append(x_statics.unsqueeze(1).repeat(1, T, 1))
 
-    if use_dynamic:
-        # (B, T, X_TIME_DIM) — déjà au bon format
-        parts.append(x_time)
+# ══════════════════════════════════════════════════════════════════════════════
+# Scheduled sampling TF → AR
+# ══════════════════════════════════════════════════════════════════════════════
 
-    if not parts:
-        return None
-
-    return torch.concat(parts, dim=-1).to(device)
+def _tf_ratio(epoch: int, total_epochs: int, warmup: int = 10) -> float:
+    if epoch < warmup:
+        return 1.0
+    progress = (epoch - warmup) / max(1, total_epochs - warmup)
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -160,13 +125,12 @@ def run_epoch(
         cfg:       DictConfig,
         device:    torch.device,
         is_train:  bool = True,
+        tf_ratio:  float = 0.0,
 ) -> tuple[float, float, float, dict[str, float]]:
 
     inr.train() if is_train else inr.eval()
-    look_back    = cfg.data.look_back_window
-    use_context  = cfg.inr.use_context
-    use_static   = cfg.inr.get("use_static_context",  True)
-    use_dynamic  = cfg.inr.get("use_dynamic_context", True)
+    look_back   = cfg.data.look_back_window
+    use_context = cfg.inr.use_context
 
     total, total_p, total_h, n = 0.0, 0.0, 0.0, 0
     all_preds, all_targets = [], []
@@ -181,13 +145,10 @@ def run_epoch(
             t         = t.to(device)
             code      = code.to(device)
 
-            # ── Contexte statique (ablation-aware) ───────────────────────────
             x_statics_in = build_context(
                 x_statics   = x_statics.to(device),
                 x_time      = x_time.to(device),
                 use_context = use_context,
-                use_static  = use_static,
-                use_dynamic = use_dynamic,
                 device      = device,
             )
             dir_idx_in = dir_idx.to(device) if use_context else None
@@ -215,6 +176,7 @@ def run_epoch(
                 code        = torch.zeros_like(code),
                 x_statics   = x_statics_in,
                 dir_idx     = dir_idx_in,
+                tf_ratio    = tf_ratio if is_train else 0.0,
             )
 
             if is_train:
@@ -253,7 +215,6 @@ def run_epoch(
 @hydra.main(config_path="conf/", config_name="config.yaml", version_base=None)
 def main(cfg: DictConfig):
 
-    # ── Seed ──────────────────────────────────────────────────────────────────
     set_seed(cfg.meta.get("seed", 42))
 
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -284,18 +245,19 @@ def main(cfg: DictConfig):
     # ── Datasets ──────────────────────────────────────────────────────────────
     trainset = NZDataset(
         ROOT / cfg.data.train_parquet,
-        mode       = 'train',
-        latent_dim = cfg.inr.latent_dim,
+        mode             = 'train',
+        latent_dim       = cfg.inr.latent_dim,
+        skip_site_filter = False,
         )
     valset = NZDataset(
         ROOT / cfg.data.val_parquet,
-        mode       = 'val',
-        latent_dim = cfg.inr.latent_dim,
-        scalers    = trainset.scalers,
+        mode             = 'val',
+        latent_dim       = cfg.inr.latent_dim,
+        scalers          = trainset.scalers,
+        skip_site_filter = False,
         )
 
     num_workers = cfg.data.num_workers
-
     train_loader = DataLoader(
         trainset,
         batch_size         = cfg.optim.batch_size,
@@ -325,10 +287,7 @@ def main(cfg: DictConfig):
         print("LSTM initialisé from scratch.")
 
     alpha     = nn.Parameter(torch.tensor([cfg.optim.lr_code], device=device))
-    optimizer = torch.optim.AdamW(
-        inr.parameters(),
-        lr = cfg.optim.lr_inr,
-    )
+    optimizer = torch.optim.AdamW(inr.parameters(), lr=cfg.optim.lr_inr)
 
     def warmup_cosine(warmup_epochs, total_epochs):
         def lr_lambda(epoch):
@@ -347,27 +306,23 @@ def main(cfg: DictConfig):
     )
 
     # ── MLflow ────────────────────────────────────────────────────────────────
+    mlflow.set_tracking_uri("http://localhost:5000")
     mlflow.set_experiment(cfg.meta.experiment_pack)
 
-    # run_name forcé depuis la config si fourni (utile pour l'ablation)
     forced_run_name = cfg.meta.get("run_name", None)
 
     with mlflow.start_run(run_name=forced_run_name):
         mlflow.log_params(OmegaConf.to_container(cfg.inr, resolve=True))
         mlflow.log_params({
-            "look_back":           cfg.data.look_back_window,
-            "horizon":             cfg.data.horizon,
-            "lstm_in_dim":         fp['lstm_in_dim'],
-            "x_time_dim":          fp['x_time_dim'],
-            "time_feats":          str(fp['time_features']),
-            "seed":                cfg.meta.get("seed", 42),
-            # Flags d'ablation loggés explicitement
-            "use_static_context":  cfg.inr.get("use_static_context",  True),
-            "use_dynamic_context": cfg.inr.get("use_dynamic_context", True),
+            "look_back":  cfg.data.look_back_window,
+            "horizon":    cfg.data.horizon,
+            "lstm_in_dim":fp['lstm_in_dim'],
+            "x_time_dim": fp['x_time_dim'],
+            "time_feats": str(fp['time_features']),
+            "seed":       cfg.meta.get("seed", 42),
         })
         run_name = mlflow.active_run().info.run_name
 
-        # ── Dossier snapshot ──────────────────────────────────────────────────
         run_dir = (
                 ROOT / "save_models" / "snapshots"
                 / cfg.meta.experiment_pack / run_name
@@ -375,7 +330,6 @@ def main(cfg: DictConfig):
         run_dir.mkdir(parents=True, exist_ok=True)
         print(f"Snapshot dir : {run_dir}")
 
-        # Scalers
         joblib.dump(trainset.scalers, run_dir / "scalers.pkl")
         scalers_legacy = ROOT / cfg.paths.scalers_file
         scalers_legacy.parent.mkdir(parents=True, exist_ok=True)
@@ -386,11 +340,20 @@ def main(cfg: DictConfig):
         ckpt_path = None
 
         for epoch in tqdm(range(cfg.optim.epochs), desc="Epochs"):
+
+            ratio = _tf_ratio(
+                epoch,
+                total_epochs = cfg.optim.epochs,
+                warmup       = cfg.optim.get("warmup_epochs", 20),
+            )
+
             tr, tr_p, tr_h, _           = run_epoch(
-                inr, train_loader, alpha, optimizer, cfg, device, is_train=True
+                inr, train_loader, alpha, optimizer,
+                cfg, device, is_train=True, tf_ratio=ratio,
             )
             va, va_p, va_h, val_metrics = run_epoch(
-                inr, val_loader, alpha, None, cfg, device, is_train=False
+                inr, val_loader, alpha, None,
+                cfg, device, is_train=False, tf_ratio=0.0,
             )
 
             if scheduler:
@@ -398,6 +361,7 @@ def main(cfg: DictConfig):
 
             mlflow.log_metrics(
                 {
+                    "tf_ratio":     ratio,
                     "lr":           scheduler.get_last_lr()[0],
                     'train_loss':   tr,  'train_loss_p': tr_p, 'train_loss_h': tr_h,
                     'val_loss':     va,  'val_loss_p':   va_p, 'val_loss_h':   va_h,
@@ -406,35 +370,31 @@ def main(cfg: DictConfig):
                 step=epoch,
             )
 
-            # ── Sauvegarde du meilleur checkpoint ────────────────────────────
             if va < best_val:
                 best_val  = va
                 ckpt_path = run_dir / f"{run_name}_{timestamp}_best.pt"
 
                 torch.save(
                     {
-                        'epoch':                epoch,
-                        'run_name':             run_name,
-                        'timestamp':            timestamp,
-                        'cfg_inr':              OmegaConf.to_container(cfg.inr,   resolve=True),
-                        'cfg_data':             OmegaConf.to_container(cfg.data,  resolve=True),
-                        'cfg_inner':            OmegaConf.to_container(cfg.inner, resolve=True),
-                        'cfg_optim':            OmegaConf.to_container(cfg.optim, resolve=True),
-                        'data_schema_fp':       fp,
-                        'alpha':                alpha.item(),
-                        'inr_state_dict':       inr.state_dict(),
-                        'optimizer':            optimizer.state_dict(),
-                        'val_loss':             va,  'val_loss_p':   va_p,  'val_loss_h':  va_h,
-                        'train_loss':           tr,  'train_loss_p': tr_p,  'train_loss_h':tr_h,
-                        'val_mae':              val_metrics.get('mae'),
-                        'val_rmse':             val_metrics.get('rmse'),
-                        'val_mape':             val_metrics.get('mape'),
-                        'static_encoder_type':  type(inr.static_encoder).__name__,
-                        'has_norm':             hasattr(inr.static_encoder, 'norm'),
-                        # Ablation flags figés dans le checkpoint
-                        'use_static_context':   cfg.inr.get("use_static_context",  True),
-                        'use_dynamic_context':  cfg.inr.get("use_dynamic_context", True),
-                        'seed':                 cfg.meta.get("seed", 42),
+                        'epoch':               epoch,
+                        'run_name':            run_name,
+                        'timestamp':           timestamp,
+                        'cfg_inr':             OmegaConf.to_container(cfg.inr,   resolve=True),
+                        'cfg_data':            OmegaConf.to_container(cfg.data,  resolve=True),
+                        'cfg_inner':           OmegaConf.to_container(cfg.inner, resolve=True),
+                        'cfg_optim':           OmegaConf.to_container(cfg.optim, resolve=True),
+                        'data_schema_fp':      fp,
+                        'alpha':               alpha.item(),
+                        'inr_state_dict':      inr.state_dict(),
+                        'optimizer':           optimizer.state_dict(),
+                        'val_loss':            va,  'val_loss_p':   va_p,  'val_loss_h':  va_h,
+                        'train_loss':          tr,  'train_loss_p': tr_p,  'train_loss_h':tr_h,
+                        'val_mae':             val_metrics.get('mae'),
+                        'val_rmse':            val_metrics.get('rmse'),
+                        'val_mape':            val_metrics.get('mape'),
+                        'static_encoder_type': type(inr.static_encoder).__name__,
+                        'has_norm':            hasattr(inr.static_encoder, 'norm'),
+                        'seed':                cfg.meta.get("seed", 42),
                     },
                     ckpt_path,
                 )
@@ -450,7 +410,6 @@ def main(cfg: DictConfig):
                     f"best={best_val:.4f} | {metrics_str}"
                 )
 
-        # ── Résumé ────────────────────────────────────────────────────────────
         print(f"\n[✓] Run terminé")
         print(f"    run_name   : {run_name}")
         print(f"    best val   : {best_val:.6f}")

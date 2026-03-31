@@ -63,7 +63,7 @@ optim:
   lr_inr:           1.0e-4
   lr_code:          1.0e-2
   weight_decay:     1.0e-5
-  batch_size:       32
+  batch_size:       128
   epochs:           100
   scheduler:        cosine  # cosine | null
   t_max:            200

@@ -31,11 +31,32 @@ from src.metalearning import outer_step
 # Métriques
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_metrics(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> dict:
-    mae  = (pred - target).abs().mean().item()
-    rmse = ((pred - target) ** 2).mean().sqrt().item()
-    mape = ((pred - target).abs() / (target.abs() + eps)).mean().item() * 100.0
-    return {"mae": mae, "rmse": rmse, "mape": mape}
+def compute_metrics(
+        pred:   torch.Tensor,
+        target: torch.Tensor,
+        eps:    float = 1e-8,
+        prefix: str   = "",
+) -> dict:
+    """
+    MAE, RMSE, MAPE, SMAPE sur un tenseur (N, T, D).
+    prefix : "past_" ou "horizon_" pour distinguer les deux phases.
+    """
+    mae   = (pred - target).abs().mean().item()
+    rmse  = ((pred - target) ** 2).mean().sqrt().item()
+    mape  = (
+                    (pred - target).abs() / (target.abs() + eps)
+            ).mean().item() * 100.0
+    smape = (
+                    2.0 * (pred - target).abs() /
+                    (pred.abs() + target.abs() + eps)
+            ).mean().item() * 100.0
+
+    return {
+        f"{prefix}mae":   mae,
+        f"{prefix}rmse":  rmse,
+        f"{prefix}mape":  mape,
+        f"{prefix}smape": smape,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -71,11 +92,10 @@ def _build_model(cfg_inr, cfg_data, device: torch.device) -> ModulatedFourierFea
 
 def _build_context(x_statics, x_time, use_context, control, device):
     """
-    Reproduit exactement la logique de build_context() de train.py.
     control :
       None / use_context=False → None  (vanilla)
-      "static_only"            → geo seulement (x_statics)
-      "dynamic_only"           → time seulement (x_time)
+      "static_only"            → geo seulement
+      "dynamic_only"           → time seulement
       "dynamic"                → geo + time (concat complet)
     """
     if not use_context:
@@ -89,7 +109,6 @@ def _build_context(x_statics, x_time, use_context, control, device):
     if control == "dynamic_only":
         return x_time.to(device)
 
-    # "dynamic" ou tout autre valeur → concat complet
     return torch.concat(
         [x_statics.unsqueeze(1).repeat(1, T, 1), x_time], dim=-1
     ).to(device)
@@ -143,7 +162,14 @@ def evaluate(
             log(f"  {d}")
 
     # ── Scalers ───────────────────────────────────────────────────────────────
-    scalers = joblib.load(SNAPSHOT_DIR / "scalers.pkl")
+    scalers  = joblib.load(SNAPSHOT_DIR / "scalers.pkl")
+    scaler_t = scalers["target"]
+
+    def inverse(tensor: torch.Tensor) -> torch.Tensor:
+        shape = tensor.shape
+        flat  = tensor.reshape(-1, 1).numpy()
+        flat  = scaler_t.inverse_transform(flat)
+        return torch.from_numpy(flat).reshape(shape)
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     testset = NZDataset(
@@ -179,8 +205,11 @@ def evaluate(
     alpha_val = ckpt.get("alpha", cfg_optim.lr_code)
     alpha     = torch.tensor([alpha_val], device=device)
 
-    look_back    = cfg_data.look_back_window
-    all_preds, all_targets = [], []
+    look_back = cfg_data.look_back_window
+
+    # ── Accumulateurs séparés passé / horizon ─────────────────────────────────
+    all_preds_p,  all_targets_p  = [], []
+    all_preds_h,  all_targets_h  = [], []
 
     # ── Inférence ─────────────────────────────────────────────────────────────
     with torch.no_grad():
@@ -193,7 +222,6 @@ def evaluate(
             t         = t.to(device)
             code      = code.to(device)
 
-            # ── Contexte statique selon le mode ───────────────────────────────
             x_statics_in = _build_context(
                 x_statics   = x_statics,
                 x_time      = x_time,
@@ -233,34 +261,40 @@ def evaluate(
                     "outer_step ne retourne pas 'out_h'.\n"
                     "Ajouter la clé dans src/metalearning.py."
                 )
+            if "out_p" not in outputs:
+                raise RuntimeError(
+                    "outer_step ne retourne pas 'out_p'.\n"
+                    "Ajouter la clé dans src/metalearning.py."
+                )
 
-            all_preds.append(outputs["out_h"].detach().cpu())
-            all_targets.append(y_horizon.detach().cpu())
+            all_preds_p.append(outputs["out_p"].detach().cpu())
+            all_targets_p.append(y_past.detach().cpu())
 
-    if not all_preds:
+            all_preds_h.append(outputs["out_h"].detach().cpu())
+            all_targets_h.append(y_horizon.detach().cpu())
+
+    if not all_preds_h:
         raise RuntimeError("Aucune prédiction collectée malgré un dataset non vide.")
 
-    preds   = torch.cat(all_preds,   dim=0)   # (N, T_horizon, 1) — normalisé
-    targets = torch.cat(all_targets, dim=0)   # (N, T_horizon, 1) — normalisé
+    # ── Inverse-transform ────────────────────────────────────────────────────
+    preds_p   = inverse(torch.cat(all_preds_p,   dim=0))
+    targets_p = inverse(torch.cat(all_targets_p, dim=0))
+    preds_h   = inverse(torch.cat(all_preds_h,   dim=0))
+    targets_h = inverse(torch.cat(all_targets_h, dim=0))
 
-    # ── Inverse-transform → espace original ──────────────────────────────────
-    scaler_t = scalers["target"]
+    # ── Métriques passé + horizon ─────────────────────────────────────────────
+    metrics_p = compute_metrics(preds_p, targets_p, prefix="past_")
+    metrics_h = compute_metrics(preds_h, targets_h, prefix="horizon_")
+    metrics   = {**metrics_p, **metrics_h}
 
-    def inverse(tensor: torch.Tensor) -> torch.Tensor:
-        shape = tensor.shape
-        flat  = tensor.reshape(-1, 1).numpy()
-        flat  = scaler_t.inverse_transform(flat)
-        return torch.from_numpy(flat).reshape(shape)
-
-    preds   = inverse(preds)
-    targets = inverse(targets)
-
-    metrics = compute_metrics(preds, targets)
-
-    log("\n── Métriques (espace original) ─────────────────")
-    for k, v in metrics.items():
-        log(f"  {k.upper():>6} : {v:.6f}")
-    log("────────────────────────────────────────────────")
+    log("\n── Métriques (espace original) ──────────────────────────────")
+    log(f"  {'':10}  {'PASSÉ (192h)':>14}  {'HORIZON (48h)':>14}")
+    log(f"  {'-'*44}")
+    for key in ["mae", "rmse", "mape", "smape"]:
+        vp = metrics[f"past_{key}"]
+        vh = metrics[f"horizon_{key}"]
+        log(f"  {key.upper():>10}  {vp:>14.4f}  {vh:>14.4f}")
+    log("─────────────────────────────────────────────────────────────")
 
     return metrics
 
@@ -276,7 +310,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers",    type=int, default=0)
     parser.add_argument("--quiet",          action="store_true")
     parser.add_argument("--no-site-filter", action="store_true", help="Désactive le filtre splits_meta.json")
-    # parse_known_args absorbe les flags inconnus transmis par compare_runs.py
     args, _ = parser.parse_known_args()
 
     metrics = evaluate(

@@ -52,10 +52,12 @@ class LSTM_HEAD(nn.Module):
         c = torch.zeros(B, self.hidden_dim, device=x_context.device)
         hs = torch.zeros(B, T,self.hidden_dim, device=x_context.device)
 
+        print(y_flow.shape)
         for t in range(T):
             x_in = torch.cat([
                 x_context[:, t, :],
-                y_flow[:, t, :],
+
+                y_flow[:, t - 1] if t > 0 else torch.zeros_like(y_flow[:, 0]),
             ], dim=-1)
 
 

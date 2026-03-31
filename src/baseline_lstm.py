@@ -61,7 +61,7 @@ class BaselineLSTM(nn.Module):
     ):
         super().__init__()
         assert mode in self.VALID_MODES, f"mode must be one of {self.VALID_MODES}"
-        self.mode      = mode
+        self.mode       = mode
         self.hidden_dim = hidden_dim
 
         # Encodeur statique (utilisé seulement si mode != flow_only)
@@ -124,7 +124,7 @@ class BaselineLSTM(nn.Module):
 
         # Phase P : teacher-forcing
         for t in range(twin_idx - 1):
-            x_in       = self._build_input(
+            x_in = self._build_input(
                 y_flow[:, t, :],
                 x_statics[:, t, :] if x_statics is not None else None,
                 x_dyn[:, t, :]     if x_dyn     is not None else None,
@@ -132,16 +132,17 @@ class BaselineLSTM(nn.Module):
             out, (h, c) = self.lstm(x_in, (h, c))
             preds.append(self.out_proj(out.squeeze(1)))   # (B, 1)
 
-        x_dyn_fix = x_dyn[:, t, :]
+        # Contexte dynamique figé au dernier pas connu (twin_idx - 1)
+        x_dyn_fix = x_dyn[:, twin_idx - 1, :] if x_dyn is not None else None
+
         # Phase H : autorégressif
         last_pred = preds[-1]
         for t in range(twin_idx - 1, T - 1):
-            x_in       = self._build_input(
+            x_in = self._build_input(
                 last_pred,
                 x_statics[:, t, :] if x_statics is not None else None,
-                x_dyn_fix     if x_dyn     is not None else None,
+                x_dyn_fix,
             )
-
             out, (h, c) = self.lstm(x_in, (h, c))
             last_pred   = self.out_proj(out.squeeze(1))
             preds.append(last_pred)
@@ -186,13 +187,13 @@ def run_epoch(model, loader, criterion, twin_idx, dir_emb, optimizer=None):
             x_dyn = x_dyn.to(DEVICE)
 
             # ── x_statics séquentiel : (B, T, STATIC_SEQ_DIM) ────────────────
-            dir_vec = dir_emb(dir_idx.to(DEVICE))                          # (B, 8)
+            dir_vec = dir_emb(dir_idx.to(DEVICE))                              # (B, 8)
             T       = x_time.size(1)
             x_statics_seq = torch.cat([
                 x_static.unsqueeze(1).expand(-1, T, -1).to(DEVICE),
                 x_time.to(DEVICE),
                 dir_vec.unsqueeze(1).expand(-1, T, -1),
-            ], dim=-1)                                                       # (B, T, STATIC_SEQ_DIM)
+            ], dim=-1)                                                          # (B, T, STATIC_SEQ_DIM)
 
             preds = model(
                 y_flow    = y,
@@ -230,13 +231,37 @@ def main(cfg: DictConfig):
     print(f"Device  : {DEVICE}")
     print(f"Mode    : {conf.model.mode}")
 
-    trainset = NZDataset(ROOT / conf.data.train_parquet, mode="train")
-    valset   = NZDataset(ROOT / conf.data.val_parquet,   mode="val", scalers=trainset.scalers)
+    trainset = NZDataset(
+        ROOT / conf.data.train_parquet,
+        mode       = "train",
+        latent_dim = conf.model.hidden_dim,
+        )
+    valset = NZDataset(
+        ROOT / conf.data.val_parquet,
+        mode       = "val",
+        latent_dim = conf.model.hidden_dim,
+        scalers    = trainset.scalers,
+        )
 
-    train_loader = DataLoader(trainset, batch_size=conf.data.batch_size, shuffle=True,  num_workers=4)
-    val_loader   = DataLoader(valset,   batch_size=conf.data.batch_size, shuffle=False, num_workers=4)
+    num_workers = conf.data.get("num_workers", 2)
+    train_loader = DataLoader(
+        trainset,
+        batch_size         = conf.data.batch_size,
+        shuffle            = True,
+        num_workers        = num_workers,
+        pin_memory         = num_workers > 0,
+        persistent_workers = num_workers > 0,
+    )
+    val_loader = DataLoader(
+        valset,
+        batch_size         = conf.data.batch_size,
+        shuffle            = False,
+        num_workers        = num_workers,
+        pin_memory         = num_workers > 0,
+        persistent_workers = num_workers > 0,
+    )
 
-    x_dyn_dim = trainset[0][3].shape[-1]   # dim de x_dyn
+    x_dyn_dim = trainset[0][3].shape[-1]   # dim de x_meteo
 
     dir_emb = DirEmbedding(output_dim=8).to(DEVICE)
 
@@ -248,7 +273,7 @@ def main(cfg: DictConfig):
 
     optimizer = optim.Adam(
         list(model.parameters()) + list(dir_emb.parameters()),
-        lr=conf.model.lr,
+        lr = conf.model.lr,
         )
     criterion = nn.MSELoss()
     scheduler = LambdaLR(
@@ -261,6 +286,7 @@ def main(cfg: DictConfig):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     joblib.dump(trainset.scalers, save_dir / "scalers.pkl")
 
+    mlflow.set_tracking_uri("http://localhost:5000")
     mlflow.set_experiment(conf.mlflow.experiment_name)
 
     with mlflow.start_run(run_name=f"baseline_{conf.model.mode}"):
@@ -279,29 +305,35 @@ def main(cfg: DictConfig):
         best_val = float("inf")
 
         for epoch in (pbar := tqdm(range(conf.model.epochs), desc="Epochs")):
-            tr, tr_p, tr_h = run_epoch(model, train_loader, criterion, conf.model.twin_idx, dir_emb, optimizer)
-            va, va_p, va_h = run_epoch(model, val_loader,   criterion, conf.model.twin_idx, dir_emb)
+            tr, tr_p, tr_h = run_epoch(
+                model, train_loader, criterion,
+                conf.model.twin_idx, dir_emb, optimizer,
+            )
+            va, va_p, va_h = run_epoch(
+                model, val_loader, criterion,
+                conf.model.twin_idx, dir_emb,
+            )
             scheduler.step()
             lr = scheduler.get_last_lr()[0]
 
             mlflow.log_metrics({
-                "train_loss": tr, "train_loss_p": tr_p, "train_loss_h": tr_h,
-                "val_loss":   va, "val_loss_p":   va_p, "val_loss_h":   va_h,
-                "lr":         lr,
+                "train_loss":   tr,  "train_loss_p": tr_p, "train_loss_h": tr_h,
+                "val_loss":     va,  "val_loss_p":   va_p, "val_loss_h":   va_h,
+                "lr":           lr,
             }, step=epoch)
 
             if va < best_val:
                 best_val  = va
                 ckpt_path = save_dir / f"{run_name}_h{conf.model.hidden_dim}_{timestamp}_best.pt"
                 torch.save({
-                    "epoch":      epoch,
-                    "model":      model.state_dict(),
-                    "dir_emb":    dir_emb.state_dict(),
-                    "optimizer":  optimizer.state_dict(),
-                    "scheduler":  scheduler.state_dict(),
-                    "mode":       conf.model.mode,
-                    "val_loss":   va,  "val_loss_p":  va_p,  "val_loss_h":  va_h,
-                    "train_loss": tr,  "train_loss_p": tr_p, "train_loss_h": tr_h,
+                    "epoch":        epoch,
+                    "model":        model.state_dict(),
+                    "dir_emb":      dir_emb.state_dict(),
+                    "optimizer":    optimizer.state_dict(),
+                    "scheduler":    scheduler.state_dict(),
+                    "mode":         conf.model.mode,
+                    "val_loss":     va,  "val_loss_p":  va_p,  "val_loss_h":  va_h,
+                    "train_loss":   tr,  "train_loss_p": tr_p, "train_loss_h": tr_h,
                 }, ckpt_path)
 
             pbar.set_postfix(
@@ -309,6 +341,11 @@ def main(cfg: DictConfig):
                 va=f"{va:.4f}", va_p=f"{va_p:.4f}", va_h=f"{va_h:.4f}",
                 lr=f"{lr:.2e}", best=f"{best_val:.4f}",
             )
+
+        print(f"\n[✓] Run terminé")
+        print(f"    run_name : {run_name}")
+        print(f"    best val : {best_val:.6f}")
+        print(f"    ckpt     : {ckpt_path}")
 
 
 if __name__ == "__main__":
